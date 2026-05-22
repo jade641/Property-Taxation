@@ -1,10 +1,20 @@
 import axios from 'axios'
 
 const productionApiBaseUrl =
-  'https://property-taxation-backend.onrender.com'
+  'https://property-taxation-backend.onrender.com/api'
 const defaultApiBaseUrl = import.meta.env.DEV ? '/api' : productionApiBaseUrl
 
-export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? defaultApiBaseUrl).replace(/\/$/, '')
+function normalizeApiBaseUrl(value: string): string {
+  const trimmed = value.replace(/\/$/, '')
+
+  if (trimmed === '/api' || trimmed.endsWith('/api')) {
+    return trimmed
+  }
+
+  return `${trimmed}/api`
+}
+
+export const API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL ?? defaultApiBaseUrl)
 
 const API_TIMEOUT_MS = 20000
 
