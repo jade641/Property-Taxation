@@ -1,19 +1,25 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 
-const backendTarget = 'http://localhost:5079'
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '')
 
-export default defineConfig({
-  plugins: [tailwindcss(), react()],
-  server: {
-    port: 5173,
-    proxy: {
-      '/api': {
-        target: backendTarget,
-        changeOrigin: true,
-        secure: false,
+  const backendTarget =
+    env.VITE_API_PROXY_TARGET ??
+    'http://127.0.0.1:5079'
+
+  return {
+    plugins: [tailwindcss(), react()],
+    server: {
+      port: 5173,
+      proxy: {
+        '/api': {
+          target: backendTarget,
+          changeOrigin: true,
+          secure: false,
+        },
       },
     },
-  },
+  }
 })

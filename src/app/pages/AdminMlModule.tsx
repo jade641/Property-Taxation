@@ -556,15 +556,31 @@ export default function AdminMlModule() {
 
   const reloadDashboardInsights = useCallback(async () => {
     try {
-      const [nextModels, nextPredictions, nextHistory, nextDatasets, nextStatus, featureResult, riskResult, histogramResult] = await Promise.all([
+      // Best-effort: clear server-side chart cache so retrains show fresh charts
+      try {
+        await api.post('/ml/chart/cache/clear')
+      } catch {
+        // ignore — cache clear is best-effort
+      }
+      // Fetch core dashboard data first so we can derive the selected model from fresh results
+      const [nextModels, nextPredictions, nextHistory, nextDatasets, nextStatus] = await Promise.all([
         getMlModels(),
         getMlPredictions(),
         getTrainingHistory(),
         listDatasets(),
         getMlTrainingStatus(),
-        fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance'),
-        fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}`),
-        fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}`),
+      ])
+
+      // Derive selected model name from returned models (prefer bestModel or Active)
+      const selectedModelName = (nextModels && nextModels.length > 0)
+        ? ((nextModels.find((m) => m.isBestModel || m.status === 'Active') ?? nextModels[0]).name ?? '')
+        : ''
+      const modelParam = selectedModelName ? `&model_name=${encodeURIComponent(selectedModelName)}` : ''
+
+      const [featureResult, riskResult, histogramResult] = await Promise.all([
+        fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance' + (selectedModelName ? `?model_name=${encodeURIComponent(selectedModelName)}` : '')),
+        fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}${modelParam}`),
+        fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}${modelParam}`),
       ])
 
       setModels(nextModels ?? [])
@@ -607,25 +623,68 @@ export default function AdminMlModule() {
   useEffect(() => {
     let active = true
 
-    Promise.all([getMlModels(), getMlPredictions(), getTrainingHistory()])
-      .then(([nextModels, nextPredictions, nextHistory]) => {
+    ;(async () => {
+      try {
+        // Fetch models first, then use them to build chart URLs with correct model_name
+        const initialModels = await getMlModels().catch(() => [] as MlModelSummary[])
+        const initialBestModel = initialModels.find((m) => m.isBestModel || m.status === 'Active') ?? initialModels[0]
+        const selectedModelNameLocal = initialBestModel?.name ?? ''
+        const modelParamLocal = selectedModelNameLocal ? `&model_name=${encodeURIComponent(selectedModelNameLocal)}` : ''
+
+        if (active) setModels(initialModels)
+
+        // Fetch predictions and history (models already fetched)
+        const [nextPredictions, nextHistory] = await Promise.all([getMlPredictions(), getTrainingHistory()])
+
         if (!active) return
-        setModels(nextModels ?? [])
         setPredictions(nextPredictions ?? [])
         setAlerts(buildAlertsFromPredictions(nextPredictions ?? []))
         setHistory(nextHistory ?? [])
-      })
-      .catch((error) => {
+
+        // Fetch charts using selected model derived from the returned models
+        try {
+          const [featureResult, riskResult, histogramResult] = await Promise.all([
+            fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance' + (selectedModelNameLocal ? `?model_name=${encodeURIComponent(selectedModelNameLocal)}` : '')),
+            fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}${modelParamLocal}`),
+            fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}${modelParamLocal}`),
+          ])
+
+          if (featureResult?.data?.features && Array.isArray(featureResult.data.features)) {
+            setArtifactFeatureImportance(featureResult.data.features)
+          }
+          setFeatureChartUnavailable(featureResult?.unavailable ?? true)
+
+          if (riskResult?.data && typeof riskResult.data.low === 'number' && typeof riskResult.data.medium === 'number' && typeof riskResult.data.high === 'number') {
+            setArtifactRiskDistribution([
+              { name: 'Low', value: riskResult.data.low },
+              { name: 'Medium', value: riskResult.data.medium },
+              { name: 'High', value: riskResult.data.high },
+            ])
+          } else {
+            setArtifactRiskDistribution([])
+          }
+          setRiskChartUnavailable(riskResult?.unavailable ?? true)
+
+          if (histogramResult?.data && Array.isArray(histogramResult.data.bins) && Array.isArray(histogramResult.data.counts)) {
+            setArtifactHistogram(histogramResult.data.bins.map((bin, index) => ({ name: bin, value: histogramResult.data?.counts[index] ?? 0 })))
+          } else {
+            setArtifactHistogram([])
+          }
+          setHistogramChartUnavailable(histogramResult?.unavailable ?? true)
+        } catch (error) {
+          console.warn('[Dashboard] Error loading charts:', error instanceof Error ? error.message : 'Unknown error')
+        }
+      } catch (error) {
         if (!active) return
         console.warn('[Dashboard] Error loading initial data:', error instanceof Error ? error.message : 'Unknown error')
         setModels([])
         setPredictions([])
         setAlerts([])
         setHistory([])
-      })
-      .finally(() => {
+      } finally {
         if (active) setLoading(false)
-      })
+      }
+    })()
 
     // load uploaded datasets separately
     listDatasets()
@@ -637,42 +696,10 @@ export default function AdminMlModule() {
         }
       })
 
-    Promise.all([
-      fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance'),
-      fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}`),
-      fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}`),
-    ])
-      .then(([featureResult, riskResult, histogramResult]) => {
-        if (!active) return
-
-        if (featureResult?.data?.features && Array.isArray(featureResult.data.features)) {
-          setArtifactFeatureImportance(featureResult.data.features)
-        }
-        setFeatureChartUnavailable(featureResult?.unavailable ?? true)
-
-        if (riskResult?.data && typeof riskResult.data.low === 'number' && typeof riskResult.data.medium === 'number' && typeof riskResult.data.high === 'number') {
-          setArtifactRiskDistribution([
-            { name: 'Low', value: riskResult.data.low },
-            { name: 'Medium', value: riskResult.data.medium },
-            { name: 'High', value: riskResult.data.high },
-          ])
-        }
-        setRiskChartUnavailable(riskResult?.unavailable ?? true)
-
-        if (histogramResult?.data && Array.isArray(histogramResult.data.bins) && Array.isArray(histogramResult.data.counts)) {
-          setArtifactHistogram(histogramResult.data.bins.map((bin, index) => ({ name: bin, value: histogramResult.data?.counts[index] ?? 0 })))
-        }
-        setHistogramChartUnavailable(histogramResult?.unavailable ?? true)
-      })
-      .catch((error) => {
-        if (!active) return
-        console.warn('[Dashboard] Error loading charts:', error instanceof Error ? error.message : 'Unknown error')
-      })
-
     return () => {
       active = false
     }
-  }, [datasetName])
+  }, [datasetName, selectedModelId])
 
   useEffect(() => {
     if (trainingStatus.status !== 'queued' && trainingStatus.status !== 'training') {
@@ -715,7 +742,8 @@ export default function AdminMlModule() {
 
   const bestModel = useMemo(() => [...models].sort((left, right) => right.f1Score - left.f1Score)[0], [models])
   const activeModel = models.find((model) => model.status === 'Active') ?? models[0]
-  const modelSelectorOptions = models.length > 0 ? models : DEFAULT_MODEL_OPTIONS
+  const modelSelectorOptions = (models.length > 0 ? models : DEFAULT_MODEL_OPTIONS)
+    .filter((m) => m.accuracy > 0 || m.rocAuc > 0 || m.f1Score > 0 || DEFAULT_MODEL_OPTIONS.some((d) => d.name === m.name))
   const highRiskPredictions = useMemo(() => predictions.filter((prediction) => prediction.riskLevel === 'High'), [predictions])
   const explanationFeatureImportance = useMemo(
     () => (selectedExplanation?.factors ?? []).map((factor) => ({ name: factor.name, importance: factor.impact })),
@@ -1031,29 +1059,38 @@ export default function AdminMlModule() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 bg-white">
-                {models.map((model) => (
-                  <tr key={model.id} className={bestModel?.id === model.id ? 'bg-blue-50/50' : ''}>
-                    <td className="px-4 py-3">
-                      <div className="font-medium text-slate-900">{model.name}</div>
-                      <div className="text-xs text-slate-500">Version {model.version} · {formatDate(model.lastTrainedAt)}</div>
-                    </td>
-                    <td className="px-4 py-3">{percent(model.accuracy * 100)}</td>
-                    <td className="px-4 py-3">{percent(model.precision * 100)}</td>
-                    <td className="px-4 py-3">{percent(model.recall * 100)}</td>
-                    <td className="px-4 py-3">{percent(model.f1Score * 100)}</td>
-                    <td className="px-4 py-3">{percent(model.rocAuc * 100)}</td>
-                    <td className="px-4 py-3">
-                      <span className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${modelStatusClass(model.status)}`}>{model.status}</span>
-                    </td>
-                    {isAdmin && (
+                {models
+                  .filter((model) => model.accuracy > 0 || model.rocAuc > 0 || model.f1Score > 0)
+                  .map((model) => (
+                    <tr key={model.id} className={bestModel?.id === model.id ? 'bg-blue-50/50' : ''}>
                       <td className="px-4 py-3">
-                        <button onClick={() => handlePromote(model.id)} disabled={model.status === 'Active'} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50">
-                          Promote
-                        </button>
+                        <div className="font-medium text-slate-900">{model.name}</div>
+                        <div className="text-xs text-slate-500">Version {model.version} · {formatDate(model.lastTrainedAt)}</div>
                       </td>
-                    )}
+                      <td className="px-4 py-3">{percent(model.accuracy * 100)}</td>
+                      <td className="px-4 py-3">{percent(model.precision * 100)}</td>
+                      <td className="px-4 py-3">{percent(model.recall * 100)}</td>
+                      <td className="px-4 py-3">{percent(model.f1Score * 100)}</td>
+                      <td className="px-4 py-3">{percent(model.rocAuc * 100)}</td>
+                      <td className="px-4 py-3">
+                        <span className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${modelStatusClass(model.status)}`}>{model.status}</span>
+                      </td>
+                      {isAdmin && (
+                        <td className="px-4 py-3">
+                          <button onClick={() => handlePromote(model.id)} disabled={model.status === 'Active'} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50">
+                            Promote
+                          </button>
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                {models.filter((model) => model.accuracy > 0 || model.rocAuc > 0 || model.f1Score > 0).length === 0 && (
+                  <tr>
+                    <td colSpan={isAdmin ? 8 : 7} className="px-4 py-6 text-center text-sm text-slate-400">
+                      No trained models with metrics yet. Train a model to see performance data.
+                    </td>
                   </tr>
-                ))}
+                )}
               </tbody>
             </table>
           </div>

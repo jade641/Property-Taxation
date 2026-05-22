@@ -1,9 +1,11 @@
 import axios from 'axios'
 
-const productionApiBaseUrl = 'https://propertytax-backend.onrender.com/api'
+const productionApiBaseUrl =
+  'https://property-taxation-backend.onrender.com'
 const defaultApiBaseUrl = import.meta.env.DEV ? '/api' : productionApiBaseUrl
 
 export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? defaultApiBaseUrl).replace(/\/$/, '')
+
 const API_TIMEOUT_MS = 20000
 
 const api = axios.create({
@@ -16,9 +18,7 @@ const api = axios.create({
 })
 
 api.interceptors.request.use((config) => {
-  if (typeof window === 'undefined') {
-    return config
-  }
+  if (typeof window === 'undefined') return config
 
   const token = window.localStorage.getItem('taxsync.token')
 

@@ -176,6 +176,27 @@ function buildActivityRows(auditLogs: AuditLogDto[]) {
     .slice(0, 5)
 }
 
+function hasMeaningfulModelMetrics(model: MlModelSummary) {
+  return model.accuracy > 0 || model.precision > 0 || model.recall > 0 || model.f1Score > 0 || model.rocAuc > 0
+}
+
+function getModelRank(model: MlModelSummary) {
+  return [model.f1Score, model.rocAuc, model.accuracy, model.precision, model.recall]
+}
+
+function compareModels(left: MlModelSummary, right: MlModelSummary) {
+  const leftRank = getModelRank(left)
+  const rightRank = getModelRank(right)
+
+  for (let index = 0; index < leftRank.length; index += 1) {
+    if (leftRank[index] !== rightRank[index]) {
+      return rightRank[index] - leftRank[index]
+    }
+  }
+
+  return (new Date(right.lastTrainedAt).getTime() || 0) - (new Date(left.lastTrainedAt).getTime() || 0)
+}
+
 export default function AdminDashboard({
   loading: _loading,
   errorMessage,
@@ -242,6 +263,24 @@ export default function AdminDashboard({
   const activityRows = useMemo(() => buildActivityRows(auditLogs), [auditLogs])
   const highRiskPredictions = useMemo(() => predictions.filter((item) => item.riskLevel === 'High'), [predictions])
   const highRiskCount = highRiskPredictions.length
+  const visibleModels = useMemo(() => {
+    const uniqueModels = new Map<string, MlModelSummary>()
+
+    models.forEach((model) => {
+      if (!hasMeaningfulModelMetrics(model)) {
+        return
+      }
+
+      const key = model.name.trim().toLowerCase()
+      const current = uniqueModels.get(key)
+
+      if (!current || compareModels(model, current) < 0) {
+        uniqueModels.set(key, model)
+      }
+    })
+
+    return [...uniqueModels.values()].sort(compareModels)
+  }, [models])
 
   const totalProperties = propertiesReport?.summary.totalProperties ?? 0
   const totalTaxCollected = collectionsReport?.summary.totalCollected ?? 0
@@ -250,7 +289,7 @@ export default function AdminDashboard({
     ? Number(((complianceItems.filter((item) => normalizePaymentStatus(item.status) === 'Paid').length / complianceItems.length) * 100).toFixed(1))
     : 0
 
-  const bestModel = models.slice().sort((left, right) => right.f1Score - left.f1Score)[0]
+  const bestModel = visibleModels[0]
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
@@ -378,7 +417,7 @@ export default function AdminDashboard({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 bg-white">
-                {models.map((model) => (
+                {visibleModels.map((model) => (
                   <tr key={model.id} className={bestModel?.id === model.id ? 'bg-blue-50/60' : ''}>
                     <td className="px-4 py-3">
                       <div className="font-medium text-blue-700">{model.name}</div>
@@ -396,6 +435,13 @@ export default function AdminDashboard({
                     </td>
                   </tr>
                 ))}
+                {visibleModels.length === 0 && (
+                  <tr>
+                    <td colSpan={7} className="px-4 py-6 text-center text-sm text-slate-400">
+                      No trained models with metrics are available yet.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
