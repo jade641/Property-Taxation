@@ -50,7 +50,7 @@ import {
 const CHART_COLORS = ['#1e3a8a', '#3b82f6', '#60a5fa', '#93c5fd', '#f59e0b', '#ef4444']
 
 function percent(value: number) {
-  return `${value.toFixed(1)}%`
+  return `${value.toFixed(2)}%`
 }
 
 function formatDate(value?: string | null) {

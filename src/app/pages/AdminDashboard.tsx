@@ -76,7 +76,7 @@ function currency(value: number) {
 }
 
 function percent(value: number) {
-  return `${value.toFixed(1)}%`
+  return `${value.toFixed(2)}%`
 }
 
 function formatDate(value?: string | null) {
