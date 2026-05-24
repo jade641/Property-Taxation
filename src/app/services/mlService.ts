@@ -113,8 +113,9 @@ async function safeGet<T>(path: string, fallback: T): Promise<T> {
   try {
     const response = await api.get(path)
     return (response.data?.data ?? response.data ?? fallback) as T
-  } catch {
-    return fallback
+  } catch (error) {
+    console.error(`[mlService] safeGet failed for ${path}:`, error)
+    throw error
   }
 }
 
@@ -122,12 +123,9 @@ async function safePost<T>(path: string, body?: unknown, fallback?: T): Promise<
   try {
     const response = await api.post(path, body)
     return (response.data?.data ?? response.data ?? fallback) as T
-  } catch {
-    if (fallback === undefined) {
-      throw new Error('Request failed and no fallback was provided.')
-    }
-
-    return fallback
+  } catch (error) {
+    console.error(`[mlService] safePost failed for ${path}:`, error)
+    throw error
   }
 }
 
@@ -174,11 +172,9 @@ export async function uploadDataset(file: File): Promise<DatasetUploadResult> {
     })
 
     return (response.data?.data ?? response.data) as DatasetUploadResult
-  } catch {
-    return {
-      success: false,
-      message: `Unable to upload dataset ${file.name}.`,
-    }
+  } catch (error) {
+    console.error(`[mlService] uploadDataset failed:`, error)
+    throw error
   }
 }
 
@@ -190,8 +186,9 @@ export async function deleteDataset(storedAs: string): Promise<boolean> {
   try {
     const response = await api.delete(`/ml/datasets/${encodeURIComponent(storedAs)}`)
     return Boolean(response?.data?.data ?? response?.data)
-  } catch {
-    return false
+  } catch (error) {
+    console.error(`[mlService] deleteDataset failed for ${storedAs}:`, error)
+    throw error
   }
 }
 
@@ -206,3 +203,4 @@ export async function getMlTrainingStatus(): Promise<MlTrainingStatus> {
     currentModel: 'N/A',
   })
 }
+

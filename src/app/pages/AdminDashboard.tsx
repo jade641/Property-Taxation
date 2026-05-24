@@ -198,7 +198,6 @@ function compareModels(left: MlModelSummary, right: MlModelSummary) {
 }
 
 export default function AdminDashboard({
-  loading: _loading,
   errorMessage,
   collectionsReport,
   delinquencyReport,

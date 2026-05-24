@@ -521,6 +521,7 @@ export default function AdminMlModule() {
   const [histogramChartUnavailable, setHistogramChartUnavailable] = useState(false)
   const [featureChartUnavailable, setFeatureChartUnavailable] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [apiError, setApiError] = useState<string | null>(null)
   const [selectedPrediction] = useState<MlPredictionItem | null>(null)
   const [selectedExplanation, setSelectedExplanation] = useState<MlExplanation | null>(null)
   const [showPredictionModal, setShowPredictionModal] = useState(false)
@@ -556,6 +557,7 @@ export default function AdminMlModule() {
 
   const reloadDashboardInsights = useCallback(async () => {
     try {
+      setApiError(null)
       // Best-effort: clear server-side chart cache so retrains show fresh charts
       try {
         await api.post('/ml/chart/cache/clear')
@@ -615,8 +617,12 @@ export default function AdminMlModule() {
       }
       setHistogramChartUnavailable(histogramResult?.unavailable ?? true)
     } catch (error) {
-      // Log but don't break - keep current dashboard data visible
-      console.warn('[Dashboard] Error refreshing insights:', error instanceof Error ? error.message : 'Unknown error')
+      console.error('[Dashboard] Error refreshing insights:', error)
+      let msg = 'Failed to connect to the Machine Learning API. The server may be sleeping or starting up.'
+      if (axios.isAxiosError(error) && error.message) {
+        msg = `Connection Error: ${error.message}`
+      }
+      setApiError(msg)
     }
   }, [datasetName])
 
@@ -625,8 +631,10 @@ export default function AdminMlModule() {
 
     ;(async () => {
       try {
+        setApiError(null)
+        setLoading(true)
         // Fetch models first, then use them to build chart URLs with correct model_name
-        const initialModels = await getMlModels().catch(() => [] as MlModelSummary[])
+        const initialModels = await getMlModels()
         const initialBestModel = initialModels.find((m) => m.isBestModel || m.status === 'Active') ?? initialModels[0]
         const selectedModelNameLocal = initialBestModel?.name ?? ''
         const modelParamLocal = selectedModelNameLocal ? `&model_name=${encodeURIComponent(selectedModelNameLocal)}` : ''
@@ -676,7 +684,12 @@ export default function AdminMlModule() {
         }
       } catch (error) {
         if (!active) return
-        console.warn('[Dashboard] Error loading initial data:', error instanceof Error ? error.message : 'Unknown error')
+        console.error('[Dashboard] Error loading initial ML data:', error)
+        let msg = 'Failed to connect to the Machine Learning API. The server may be sleeping or starting up.'
+        if (axios.isAxiosError(error) && error.message) {
+          msg = `Connection Error: ${error.message}`
+        }
+        setApiError(msg)
         setModels([])
         setPredictions([])
         setAlerts([])
@@ -700,6 +713,7 @@ export default function AdminMlModule() {
       active = false
     }
   }, [datasetName, selectedModelId])
+
 
   useEffect(() => {
     if (trainingStatus.status !== 'queued' && trainingStatus.status !== 'training') {
@@ -938,6 +952,28 @@ export default function AdminMlModule() {
     <div className="space-y-6 max-w-7xl mx-auto pb-10">
       <ToastStack toasts={toasts} onDismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))} />
 
+      {apiError && (
+        <div className="flex items-start gap-4 rounded-2xl border border-red-200 bg-red-50 p-5 shadow-sm">
+          <div className="rounded-xl bg-red-100 p-2 text-red-700">
+            <AlertTriangle className="h-6 w-6" />
+          </div>
+          <div className="flex-1">
+            <h3 className="text-sm font-semibold text-red-900">Machine Learning API Connection Failure</h3>
+            <p className="mt-1 text-sm text-red-700">{apiError}</p>
+            <button
+              onClick={() => {
+                setLoading(true);
+                void reloadDashboardInsights();
+              }}
+              className="mt-3 inline-flex items-center gap-2 rounded-lg bg-red-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-800 transition"
+            >
+              <RefreshCcw className="h-3 w-3 animate-spin" />
+              Retry Connection
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
         <div>
           <p className="inline-flex items-center gap-2 rounded-full border border-blue-200 bg-blue-50 px-3 py-1 text-xs font-semibold uppercase tracking-wider text-blue-800">
@@ -983,16 +1019,34 @@ export default function AdminMlModule() {
           subtitle="Low / medium / high risk forecast mix"
           notice={riskChartUnavailable ? 'ML service unavailable — showing fallback data' : undefined}
         >
-          <div className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={chartRiskDistribution} dataKey="value" nameKey="name" innerRadius={58} outerRadius={90} paddingAngle={3}>
-                  {chartRiskDistribution.map((entry, index) => <Cell key={entry.name} fill={CHART_COLORS[index % CHART_COLORS.length]} />)}
-                </Pie>
-                <Tooltip />
-                <Legend />
-              </PieChart>
-            </ResponsiveContainer>
+          <div className="h-72 relative">
+            {riskChartUnavailable ? (
+              <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-50 border border-slate-200 p-6 text-center">
+                <AlertTriangle className="h-8 w-8 text-amber-500 mb-2 animate-bounce" />
+                <p className="text-sm font-medium text-slate-800">ML Risk Chart Unavailable</p>
+                <p className="text-xs text-slate-500 mt-1 max-w-[200px]">The ML service is starting up or temporarily sleeping.</p>
+                <button
+                  onClick={() => {
+                    setLoading(true);
+                    void reloadDashboardInsights();
+                  }}
+                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 shadow-sm"
+                >
+                  <RefreshCcw className="h-3 w-3" />
+                  Retry Chart
+                </button>
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie data={chartRiskDistribution} dataKey="value" nameKey="name" innerRadius={58} outerRadius={90} paddingAngle={3}>
+                    {chartRiskDistribution.map((entry, index) => <Cell key={entry.name} fill={CHART_COLORS[index % CHART_COLORS.length]} />)}
+                  </Pie>
+                  <Tooltip />
+                  <Legend />
+                </PieChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </SectionCard>
 
@@ -1001,16 +1055,34 @@ export default function AdminMlModule() {
           subtitle="Distribution of late-payment risk scores"
           notice={histogramChartUnavailable ? 'ML service unavailable — showing fallback data' : undefined}
         >
-          <div className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartProbabilityHistogram}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                <XAxis dataKey="name" stroke="#64748b" tickLine={false} axisLine={false} />
-                <YAxis stroke="#64748b" tickLine={false} axisLine={false} allowDecimals={false} />
-                <Tooltip />
-                <Bar dataKey="value" fill="#1e3a8a" radius={[8, 8, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+          <div className="h-72 relative">
+            {histogramChartUnavailable ? (
+              <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-50 border border-slate-200 p-6 text-center">
+                <AlertTriangle className="h-8 w-8 text-amber-500 mb-2 animate-bounce" />
+                <p className="text-sm font-medium text-slate-800">ML Histogram Unavailable</p>
+                <p className="text-xs text-slate-500 mt-1 max-w-[200px]">The ML service is starting up or temporarily sleeping.</p>
+                <button
+                  onClick={() => {
+                    setLoading(true);
+                    void reloadDashboardInsights();
+                  }}
+                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 shadow-sm"
+                >
+                  <RefreshCcw className="h-3 w-3" />
+                  Retry Chart
+                </button>
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartProbabilityHistogram}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="name" stroke="#64748b" tickLine={false} axisLine={false} />
+                  <YAxis stroke="#64748b" tickLine={false} axisLine={false} allowDecimals={false} />
+                  <Tooltip />
+                  <Bar dataKey="value" fill="#1e3a8a" radius={[8, 8, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </SectionCard>
 
@@ -1019,16 +1091,34 @@ export default function AdminMlModule() {
           subtitle="Top contributing drivers for the current explanation"
           notice={featureChartUnavailable ? 'ML service unavailable — showing fallback data' : undefined}
         >
-          <div className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartFeatureImportance} layout="vertical">
-                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                <XAxis type="number" stroke="#64748b" tickLine={false} axisLine={false} />
-                <YAxis type="category" dataKey="name" stroke="#64748b" width={130} tickLine={false} axisLine={false} />
-                <Tooltip />
-                <Bar dataKey="importance" fill="#3b82f6" radius={[0, 8, 8, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
+          <div className="h-72 relative">
+            {featureChartUnavailable ? (
+              <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-50 border border-slate-200 p-6 text-center">
+                <AlertTriangle className="h-8 w-8 text-amber-500 mb-2 animate-bounce" />
+                <p className="text-sm font-medium text-slate-800">ML Feature Importance Unavailable</p>
+                <p className="text-xs text-slate-500 mt-1 max-w-[200px]">The ML service is starting up or temporarily sleeping.</p>
+                <button
+                  onClick={() => {
+                    setLoading(true);
+                    void reloadDashboardInsights();
+                  }}
+                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 shadow-sm"
+                >
+                  <RefreshCcw className="h-3 w-3" />
+                  Retry Chart
+                </button>
+              </div>
+            ) : (
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartFeatureImportance} layout="vertical">
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis type="number" stroke="#64748b" tickLine={false} axisLine={false} />
+                  <YAxis type="category" dataKey="name" stroke="#64748b" width={130} tickLine={false} axisLine={false} />
+                  <Tooltip />
+                  <Bar dataKey="importance" fill="#3b82f6" radius={[0, 8, 8, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
           </div>
         </SectionCard>
       </div>
