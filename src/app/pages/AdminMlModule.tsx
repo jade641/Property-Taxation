@@ -30,11 +30,16 @@ import api from '../services/api'
 import { useAuth } from '../context/AuthContext'
 import { exportCsv } from '../services/exportService'
 import {
+  deleteTrainingHistoryEntry,
+  dismissMlAlert,
   getMlExplanation,
+  getMlAlerts,
   getMlModels,
   getMlPredictions,
   getMlTrainingStatus,
   getTrainingHistory,
+  promoteModel,
+  resolveMlAlert,
   trainModel,
   uploadDataset,
   listDatasets,
@@ -51,6 +56,10 @@ const CHART_COLORS = ['#1e3a8a', '#3b82f6', '#60a5fa', '#93c5fd', '#f59e0b', '#e
 
 function percent(value: number) {
   return `${value.toFixed(2)}%`
+}
+
+function normalizeModelKey(value?: string | null) {
+  return (value ?? '').trim().toLowerCase()
 }
 
 function formatDate(value?: string | null) {
@@ -184,24 +193,24 @@ function ToastStack({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: nu
 
 function MetricCard({ title, value, subtitle, icon: Icon }: { title: string; value: string; subtitle: string; icon: ElementType }) {
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-      <div className="flex items-start gap-3">
-        <div className="rounded-xl border border-blue-100 bg-blue-50 p-3 text-blue-700">
+    <div className="h-full overflow-hidden rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+      <div className="flex min-w-0 items-start gap-3">
+        <div className="shrink-0 rounded-xl border border-blue-100 bg-blue-50 p-3 text-blue-700">
           <Icon className="h-5 w-5" />
         </div>
-        <div>
+        <div className="min-w-0 flex-1">
           <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">{title}</p>
-          <p className="mt-2 text-3xl font-semibold tracking-tight text-slate-900">{value}</p>
-          <p className="mt-1 text-xs text-slate-500">{subtitle}</p>
+          <p className="mt-2 max-w-full break-words text-2xl font-semibold leading-tight tracking-tight text-slate-900 sm:text-3xl">{value}</p>
+          <p className="mt-1 break-all text-xs leading-5 text-slate-500">{subtitle}</p>
         </div>
       </div>
     </div>
   )
 }
 
-function SectionCard({ title, subtitle, children, action, notice }: { title: string; subtitle: string; children: ReactNode; action?: ReactNode; notice?: ReactNode }) {
+function SectionCard({ title, subtitle, children, action, notice, className }: { title: string; subtitle: string; children: ReactNode; action?: ReactNode; notice?: ReactNode; className?: string }) {
   return (
-    <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+    <section className={`rounded-2xl border border-slate-200 bg-white p-5 shadow-sm${className ? ` ${className}` : ''}`}>
       <div className="mb-4 flex items-start justify-between gap-4">
         <div>
           <h2 className="text-lg font-semibold text-slate-900">{title}</h2>
@@ -451,7 +460,39 @@ function buildAlertsFromPredictions(predictions: MlPredictionItem[]): MlAlert[] 
       createdAt: new Date().toISOString(),
       propertyId: prediction.propertyId,
       severity: 'High',
+      source: 'derived',
     }))
+}
+
+function buildDatasetSummaryAlert(highRiskCount: number, datasetLabel: string, modelName: string): MlAlert[] {
+  if (highRiskCount <= 0) {
+    return []
+  }
+
+  return [{
+    id: -1,
+    title: 'High-risk records detected',
+    description: `${highRiskCount.toLocaleString('en-PH')} records from ${datasetLabel} were classified as high risk by ${modelName || 'the selected model'}.`,
+    category: 'High-risk',
+    status: 'Open',
+    createdAt: new Date().toISOString(),
+    propertyId: datasetLabel,
+    severity: 'High',
+    source: 'derived',
+  }]
+}
+
+function buildAlertFeed(storedAlerts: MlAlert[], predictions: MlPredictionItem[], highRiskCount: number, datasetLabel: string, modelName: string): MlAlert[] {
+  if (storedAlerts.length > 0) {
+    return storedAlerts
+  }
+
+  const predictionAlerts = buildAlertsFromPredictions(predictions)
+  if (predictionAlerts.length > 0) {
+    return predictionAlerts
+  }
+
+  return buildDatasetSummaryAlert(highRiskCount, datasetLabel, modelName)
 }
 
 function buildAccountantExportRows(predictions: MlPredictionItem[]) {
@@ -532,6 +573,7 @@ export default function AdminMlModule() {
   const [datasetName, setDatasetName] = useState('propertytax_training_dataset.csv')
   const [trainingStatus, setTrainingStatus] = useState<MlTrainingStatus>({ status: 'idle', progress: 0, currentModel: 'N/A' })
   const [retrainRequestPending, setRetrainRequestPending] = useState(false)
+  const [deletingTrainingHistoryId, setDeletingTrainingHistoryId] = useState<number | null>(null)
   const [trainingHistoryPage, setTrainingHistoryPage] = useState(1)
   const [toasts, setToasts] = useState<Toast[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -555,6 +597,15 @@ export default function AdminMlModule() {
     }
   }, [])
 
+  const loadAlertsSafely = useCallback(async () => {
+    try {
+      return await getMlAlerts()
+    } catch (error) {
+      console.warn('[Dashboard] Error loading alerts:', error instanceof Error ? error.message : 'Unknown error')
+      return [] as MlAlert[]
+    }
+  }, [])
+
   const reloadDashboardInsights = useCallback(async () => {
     try {
       setApiError(null)
@@ -565,17 +616,20 @@ export default function AdminMlModule() {
         // ignore — cache clear is best-effort
       }
       // Fetch core dashboard data first so we can derive the selected model from fresh results
-      const [nextModels, nextPredictions, nextHistory, nextDatasets, nextStatus] = await Promise.all([
+      const [nextModels, nextPredictions, nextAlerts, nextHistory, nextDatasets, nextStatus] = await Promise.all([
         getMlModels(),
         getMlPredictions(),
+        loadAlertsSafely(),
         getTrainingHistory(),
         listDatasets(),
         getMlTrainingStatus(),
       ])
 
-      // Derive selected model name from returned models (prefer bestModel or Active)
+      const selectedDatasetLabel = datasetName.trim() || 'No dataset selected'
       const selectedModelName = (nextModels && nextModels.length > 0)
-        ? ((nextModels.find((m) => m.isBestModel || m.status === 'Active') ?? nextModels[0]).name ?? '')
+        ? ((selectedModelId !== null
+          ? nextModels.find((model) => model.id === selectedModelId)
+          : undefined) ?? nextModels.find((model) => model.isBestModel || model.status === 'Active') ?? nextModels[0]).name ?? ''
         : ''
       const modelParam = selectedModelName ? `&model_name=${encodeURIComponent(selectedModelName)}` : ''
 
@@ -585,9 +639,13 @@ export default function AdminMlModule() {
         fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}${modelParam}`),
       ])
 
+      const fallbackHighRiskCount = riskResult?.data && typeof riskResult.data.high === 'number'
+        ? riskResult.data.high
+        : 0
+
       setModels(nextModels ?? [])
       setPredictions(nextPredictions ?? [])
-      setAlerts(buildAlertsFromPredictions(nextPredictions ?? []))
+      setAlerts(buildAlertFeed(nextAlerts ?? [], nextPredictions ?? [], fallbackHighRiskCount, selectedDatasetLabel, selectedModelName))
       setHistory(nextHistory ?? [])
       setDatasets(nextDatasets ?? [])
       setTrainingStatus(nextStatus ?? { status: 'idle', progress: 0, currentModel: 'N/A' })
@@ -623,8 +681,10 @@ export default function AdminMlModule() {
         msg = `Connection Error: ${error.message}`
       }
       setApiError(msg)
+    } finally {
+      setLoading(false)
     }
-  }, [datasetName])
+  }, [datasetName, loadAlertsSafely, selectedModelId])
 
   useEffect(() => {
     let active = true
@@ -635,18 +695,22 @@ export default function AdminMlModule() {
         setLoading(true)
         // Fetch models first, then use them to build chart URLs with correct model_name
         const initialModels = await getMlModels()
-        const initialBestModel = initialModels.find((m) => m.isBestModel || m.status === 'Active') ?? initialModels[0]
-        const selectedModelNameLocal = initialBestModel?.name ?? ''
+        const initialSelectedModel = (selectedModelId !== null
+          ? initialModels.find((model) => model.id === selectedModelId)
+          : undefined) ?? initialModels.find((model) => model.isBestModel || model.status === 'Active') ?? initialModels[0]
+        const selectedModelNameLocal = initialSelectedModel?.name ?? ''
         const modelParamLocal = selectedModelNameLocal ? `&model_name=${encodeURIComponent(selectedModelNameLocal)}` : ''
+        const selectedDatasetLabel = datasetName.trim() || 'No dataset selected'
 
         if (active) setModels(initialModels)
 
         // Fetch predictions and history (models already fetched)
-        const [nextPredictions, nextHistory] = await Promise.all([getMlPredictions(), getTrainingHistory()])
+        const [nextPredictions, nextAlerts, nextHistory] = await Promise.all([getMlPredictions(), loadAlertsSafely(), getTrainingHistory()])
+
+        let fallbackHighRiskCount = 0
 
         if (!active) return
         setPredictions(nextPredictions ?? [])
-        setAlerts(buildAlertsFromPredictions(nextPredictions ?? []))
         setHistory(nextHistory ?? [])
 
         // Fetch charts using selected model derived from the returned models
@@ -663,6 +727,7 @@ export default function AdminMlModule() {
           setFeatureChartUnavailable(featureResult?.unavailable ?? true)
 
           if (riskResult?.data && typeof riskResult.data.low === 'number' && typeof riskResult.data.medium === 'number' && typeof riskResult.data.high === 'number') {
+            fallbackHighRiskCount = riskResult.data.high
             setArtifactRiskDistribution([
               { name: 'Low', value: riskResult.data.low },
               { name: 'Medium', value: riskResult.data.medium },
@@ -682,6 +747,9 @@ export default function AdminMlModule() {
         } catch (error) {
           console.warn('[Dashboard] Error loading charts:', error instanceof Error ? error.message : 'Unknown error')
         }
+
+        if (!active) return
+        setAlerts(buildAlertFeed(nextAlerts ?? [], nextPredictions ?? [], fallbackHighRiskCount, selectedDatasetLabel, selectedModelNameLocal))
       } catch (error) {
         if (!active) return
         console.error('[Dashboard] Error loading initial ML data:', error)
@@ -712,7 +780,7 @@ export default function AdminMlModule() {
     return () => {
       active = false
     }
-  }, [datasetName, selectedModelId])
+  }, [datasetName, loadAlertsSafely, selectedModelId])
 
 
   useEffect(() => {
@@ -758,7 +826,6 @@ export default function AdminMlModule() {
   const activeModel = models.find((model) => model.status === 'Active') ?? models[0]
   const modelSelectorOptions = (models.length > 0 ? models : DEFAULT_MODEL_OPTIONS)
     .filter((m) => m.accuracy > 0 || m.rocAuc > 0 || m.f1Score > 0 || DEFAULT_MODEL_OPTIONS.some((d) => d.name === m.name))
-  const highRiskPredictions = useMemo(() => predictions.filter((prediction) => prediction.riskLevel === 'High'), [predictions])
   const explanationFeatureImportance = useMemo(
     () => (selectedExplanation?.factors ?? []).map((factor) => ({ name: factor.name, importance: factor.impact })),
     [selectedExplanation],
@@ -792,6 +859,22 @@ export default function AdminMlModule() {
           ? explanationFeatureImportance
           : [])
       : []
+  const focusedModel = selectedModel ?? activeModel
+  const selectedDatasetLabel = datasetName.trim() || 'No dataset selected'
+  const selectedHighRiskCount = chartRiskDistribution.find((bucket) => bucket.name === 'High')?.value ?? 0
+  const trainingMetricsMatchFocusedModel = normalizeModelKey(trainingStatus.currentModel) !== ''
+    && normalizeModelKey(trainingStatus.currentModel) !== 'n/a'
+    && normalizeModelKey(trainingStatus.currentModel) === normalizeModelKey(focusedModel?.name)
+  const displayedMetrics = {
+    accuracy: trainingMetricsMatchFocusedModel ? (trainingStatus.accuracy ?? focusedModel?.accuracy ?? 0) : (focusedModel?.accuracy ?? 0),
+    precision: trainingMetricsMatchFocusedModel ? (trainingStatus.precision ?? focusedModel?.precision ?? 0) : (focusedModel?.precision ?? 0),
+    recall: trainingMetricsMatchFocusedModel ? (trainingStatus.recall ?? focusedModel?.recall ?? 0) : (focusedModel?.recall ?? 0),
+    f1Score: trainingMetricsMatchFocusedModel ? (trainingStatus.f1Score ?? focusedModel?.f1Score ?? 0) : (focusedModel?.f1Score ?? 0),
+    rocAuc: trainingMetricsMatchFocusedModel ? (trainingStatus.rocAuc ?? focusedModel?.rocAuc ?? 0) : (focusedModel?.rocAuc ?? 0),
+  }
+  const displayedLastTrainedAt = trainingMetricsMatchFocusedModel
+    ? (trainingStatus.lastTrainedAt ?? focusedModel?.lastTrainedAt)
+    : focusedModel?.lastTrainedAt
 
   // Training History pagination
   const itemsPerPage = 8
@@ -931,21 +1014,85 @@ export default function AdminMlModule() {
     }
   }
 
-  const handlePromote = (modelId: number) => {
-    setModels((current) => current.map((model) => ({ ...model, status: model.id === modelId ? 'Active' : 'Archived' })))
-    pushToast('Active model switched', 'The selected model is now active in the UI.', 'emerald')
+  const handlePromote = async (modelId: number) => {
+    try {
+      setLoading(true)
+      await promoteModel(modelId)
+      setSelectedModelId(modelId)
+      await reloadDashboardInsights()
+      pushToast('Active model switched', 'The selected model is now active across the ML module.', 'emerald')
+    } catch (error) {
+      setLoading(false)
+      pushToast('Model switch failed', error instanceof Error ? error.message : 'Unable to activate the selected model.', 'red')
+    }
   }
 
   const getModelOptionLabel = (model: MlModelSummary) => model.displayLabel ?? `${model.name} · ${model.version}`
 
   const handleResolveAlert = async (alertId: number) => {
-    setAlerts((current) => current.map((alert) => (alert.id === alertId ? { ...alert, status: 'Resolved' } : alert)))
-    pushToast('Alert resolved', 'The alert has been marked as resolved.', 'emerald')
+    const targetAlert = alerts.find((alert) => alert.id === alertId)
+    if (!targetAlert) return
+
+    if (targetAlert.source !== 'stored') {
+      setAlerts((current) => current.map((alert) => (alert.id === alertId ? { ...alert, status: 'Resolved' } : alert)))
+      pushToast('Alert resolved', 'The alert has been marked as resolved.', 'emerald')
+      return
+    }
+
+    try {
+      const updatedAlert = await resolveMlAlert(alertId)
+      setAlerts((current) => current.map((alert) => (alert.id === alertId ? updatedAlert : alert)))
+      pushToast('Alert resolved', 'The alert has been marked as resolved.', 'emerald')
+    } catch (error) {
+      pushToast('Resolve failed', error instanceof Error ? error.message : 'Unable to update the selected alert.', 'red')
+    }
   }
 
-  const handleDismissAlert = (alertId: number) => {
-    setAlerts((current) => current.map((alert) => (alert.id === alertId ? { ...alert, status: 'Dismissed' } : alert)))
-    pushToast('Alert dismissed', 'The alert has been marked as dismissed.', 'blue')
+  const handleDismissAlert = async (alertId: number) => {
+    const targetAlert = alerts.find((alert) => alert.id === alertId)
+    if (!targetAlert) return
+
+    if (targetAlert.source !== 'stored') {
+      setAlerts((current) => current.map((alert) => (alert.id === alertId ? { ...alert, status: 'Dismissed' } : alert)))
+      pushToast('Alert dismissed', 'The alert has been marked as dismissed.', 'blue')
+      return
+    }
+
+    try {
+      const updatedAlert = await dismissMlAlert(alertId)
+      setAlerts((current) => current.map((alert) => (alert.id === alertId ? updatedAlert : alert)))
+      pushToast('Alert dismissed', 'The alert has been marked as dismissed.', 'blue')
+    } catch (error) {
+      pushToast('Dismiss failed', error instanceof Error ? error.message : 'Unable to update the selected alert.', 'red')
+    }
+  }
+
+  const handleDeleteTrainingHistory = async (historyItem: TrainingHistoryItem) => {
+    const isInProgress = historyItem.status === 'Queued' || historyItem.status === 'Running' || historyItem.status === 'Training'
+    if (isInProgress) {
+      pushToast('Delete unavailable', 'A training job that is still in progress cannot be deleted.', 'amber')
+      return
+    }
+
+    if (!confirm(`Delete training history for ${historyItem.modelName} using ${historyItem.datasetName}? This action cannot be undone.`)) {
+      return
+    }
+
+    try {
+      setDeletingTrainingHistoryId(historyItem.id)
+      await deleteTrainingHistoryEntry(historyItem.id)
+      const [updatedHistory, updatedTrainingStatus] = await Promise.all([
+        getTrainingHistory(),
+        getMlTrainingStatus(),
+      ])
+      setHistory(updatedHistory ?? [])
+      setTrainingStatus(updatedTrainingStatus ?? { status: 'idle', progress: 0, currentModel: 'N/A' })
+      pushToast('Training history deleted', 'The selected training history entry was removed.', 'emerald')
+    } catch (error) {
+      pushToast('Delete failed', error instanceof Error ? error.message : 'Unable to delete the selected training history entry.', 'red')
+    } finally {
+      setDeletingTrainingHistoryId(null)
+    }
   }
 
   return (
@@ -1006,9 +1153,9 @@ export default function AdminMlModule() {
 
       {!loading && (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <MetricCard title="Active Model" value={activeModel?.name ?? 'N/A'} subtitle={activeModel ? `${activeModel.version} · ${percent(activeModel.rocAuc * 100)} ROC AUC` : 'No active model available'} icon={Brain} />
-          <MetricCard title="High-Risk Properties" value={highRiskPredictions.length.toLocaleString('en-PH')} subtitle="ML-flagged for audit review" icon={AlertTriangle} />
-          <MetricCard title="Prediction Confidence" value={selectedExplanation ? percent(selectedExplanation.confidenceScore) : '—'} subtitle="Selected explanation confidence" icon={CheckCircle2} />
+          <MetricCard title="Selected Model" value={focusedModel?.name ?? 'N/A'} subtitle={focusedModel ? `${selectedDatasetLabel} · ${percent(displayedMetrics.rocAuc * 100)} ROC AUC` : 'No trained model available'} icon={Brain} />
+          <MetricCard title="High-Risk Records" value={selectedHighRiskCount.toLocaleString('en-PH')} subtitle={`For ${selectedDatasetLabel}`} icon={AlertTriangle} />
+          <MetricCard title="Selected F1 Score" value={focusedModel ? percent(displayedMetrics.f1Score * 100) : '—'} subtitle={focusedModel ? `${focusedModel.name} metrics for the current selection` : 'No selected model metrics'} icon={CheckCircle2} />
           <MetricCard title="Training Jobs" value={history.length.toLocaleString('en-PH')} subtitle="Recent training runs and status" icon={Database} />
         </div>
       )}
@@ -1017,10 +1164,10 @@ export default function AdminMlModule() {
         <SectionCard
           title="Risk Distribution"
           subtitle="Low / medium / high risk forecast mix"
-          notice={riskChartUnavailable ? 'ML service unavailable — showing fallback data' : undefined}
+          notice={riskChartUnavailable ? (chartRiskDistribution.length > 0 ? 'ML service unavailable — showing fallback data' : 'ML service unavailable') : undefined}
         >
           <div className="h-72 relative">
-            {riskChartUnavailable ? (
+            {riskChartUnavailable && chartRiskDistribution.length === 0 ? (
               <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-50 border border-slate-200 p-6 text-center">
                 <AlertTriangle className="h-8 w-8 text-amber-500 mb-2 animate-bounce" />
                 <p className="text-sm font-medium text-slate-800">ML Risk Chart Unavailable</p>
@@ -1053,10 +1200,10 @@ export default function AdminMlModule() {
         <SectionCard
           title="Probability Histogram"
           subtitle="Distribution of late-payment risk scores"
-          notice={histogramChartUnavailable ? 'ML service unavailable — showing fallback data' : undefined}
+          notice={histogramChartUnavailable ? (chartProbabilityHistogram.length > 0 ? 'ML service unavailable — showing fallback data' : 'ML service unavailable') : undefined}
         >
           <div className="h-72 relative">
-            {histogramChartUnavailable ? (
+            {histogramChartUnavailable && chartProbabilityHistogram.length === 0 ? (
               <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-50 border border-slate-200 p-6 text-center">
                 <AlertTriangle className="h-8 w-8 text-amber-500 mb-2 animate-bounce" />
                 <p className="text-sm font-medium text-slate-800">ML Histogram Unavailable</p>
@@ -1089,10 +1236,10 @@ export default function AdminMlModule() {
         <SectionCard
           title="Feature Importance"
           subtitle="Top contributing drivers for the current explanation"
-          notice={featureChartUnavailable ? 'ML service unavailable — showing fallback data' : undefined}
+          notice={featureChartUnavailable ? (chartFeatureImportance.length > 0 ? 'ML service unavailable — showing fallback data' : 'ML service unavailable') : undefined}
         >
           <div className="h-72 relative">
-            {featureChartUnavailable ? (
+            {featureChartUnavailable && chartFeatureImportance.length === 0 ? (
               <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-50 border border-slate-200 p-6 text-center">
                 <AlertTriangle className="h-8 w-8 text-amber-500 mb-2 animate-bounce" />
                 <p className="text-sm font-medium text-slate-800">ML Feature Importance Unavailable</p>
@@ -1123,92 +1270,135 @@ export default function AdminMlModule() {
         </SectionCard>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
-        <SectionCard
-          title="Model Performance"
-          subtitle="Compare active and archived models"
-          action={isAdmin ? (
-            <button onClick={() => setShowRetrainModal(true)} className="inline-flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-medium text-blue-800 hover:bg-blue-100">
-              <RefreshCcw className="h-4 w-4" />
-              Retrain Model
-            </button>
-          ) : null}
-        >
-          <div className="overflow-hidden rounded-xl border border-slate-200">
-            <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
-              <thead className="bg-slate-50 text-xs uppercase tracking-wider text-slate-500">
-                <tr>
-                  <th className="px-4 py-3">Model</th>
-                  <th className="px-4 py-3">Accuracy</th>
-                  <th className="px-4 py-3">Precision</th>
-                  <th className="px-4 py-3">Recall</th>
-                  <th className="px-4 py-3">F1</th>
-                  <th className="px-4 py-3">ROC AUC</th>
-                  <th className="px-4 py-3">Status</th>
-                  {isAdmin && <th className="px-4 py-3">Action</th>}
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-200 bg-white">
-                {models
-                  .filter((model) => model.accuracy > 0 || model.rocAuc > 0 || model.f1Score > 0)
-                  .map((model) => (
-                    <tr key={model.id} className={bestModel?.id === model.id ? 'bg-blue-50/50' : ''}>
-                      <td className="px-4 py-3">
-                        <div className="font-medium text-slate-900">{model.name}</div>
-                        <div className="text-xs text-slate-500">Version {model.version} · {formatDate(model.lastTrainedAt)}</div>
-                      </td>
-                      <td className="px-4 py-3">{percent(model.accuracy * 100)}</td>
-                      <td className="px-4 py-3">{percent(model.precision * 100)}</td>
-                      <td className="px-4 py-3">{percent(model.recall * 100)}</td>
-                      <td className="px-4 py-3">{percent(model.f1Score * 100)}</td>
-                      <td className="px-4 py-3">{percent(model.rocAuc * 100)}</td>
-                      <td className="px-4 py-3">
-                        <span className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${modelStatusClass(model.status)}`}>{model.status}</span>
-                      </td>
-                      {isAdmin && (
-                        <td className="px-4 py-3">
-                          <button onClick={() => handlePromote(model.id)} disabled={model.status === 'Active'} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50">
-                            Promote
-                          </button>
-                        </td>
-                      )}
-                    </tr>
-                  ))}
-                {models.filter((model) => model.accuracy > 0 || model.rocAuc > 0 || model.f1Score > 0).length === 0 && (
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-6">
+        <div className={`flex h-full flex-col gap-4 ${isAdmin ? 'xl:col-span-3' : 'xl:col-span-6'}`}>
+          <SectionCard
+            title="Model Performance"
+            subtitle="Compare active and archived models"
+            action={isAdmin ? (
+              <button onClick={() => setShowRetrainModal(true)} className="inline-flex items-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-medium text-blue-800 hover:bg-blue-100">
+                <RefreshCcw className="h-4 w-4" />
+                Retrain Model
+              </button>
+            ) : null}
+          >
+            <div className="overflow-hidden rounded-xl border border-slate-200">
+              <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
+                <thead className="bg-slate-50 text-xs uppercase tracking-wider text-slate-500">
                   <tr>
-                    <td colSpan={isAdmin ? 8 : 7} className="px-4 py-6 text-center text-sm text-slate-400">
-                      No trained models with metrics yet. Train a model to see performance data.
-                    </td>
+                    <th className="px-4 py-3">Model</th>
+                    <th className="px-4 py-3">Accuracy</th>
+                    <th className="px-4 py-3">Precision</th>
+                    <th className="px-4 py-3">Recall</th>
+                    <th className="px-4 py-3">F1</th>
+                    <th className="px-4 py-3">ROC AUC</th>
+                    <th className="px-4 py-3">Status</th>
+                    {isAdmin && <th className="px-4 py-3">Action</th>}
                   </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </SectionCard>
+                </thead>
+                <tbody className="divide-y divide-slate-200 bg-white">
+                  {models
+                    .filter((model) => model.accuracy > 0 || model.rocAuc > 0 || model.f1Score > 0)
+                    .map((model) => (
+                      <tr key={model.id} className={bestModel?.id === model.id ? 'bg-blue-50/50' : ''}>
+                        <td className="px-4 py-3">
+                          <div className="font-medium text-slate-900">{model.name}</div>
+                          <div className="text-xs text-slate-500">Version {model.version} · {formatDate(model.lastTrainedAt)}</div>
+                        </td>
+                        <td className="px-4 py-3">{percent(model.accuracy * 100)}</td>
+                        <td className="px-4 py-3">{percent(model.precision * 100)}</td>
+                        <td className="px-4 py-3">{percent(model.recall * 100)}</td>
+                        <td className="px-4 py-3">{percent(model.f1Score * 100)}</td>
+                        <td className="px-4 py-3">{percent(model.rocAuc * 100)}</td>
+                        <td className="px-4 py-3">
+                          <span className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${modelStatusClass(model.status)}`}>{model.status}</span>
+                        </td>
+                        {isAdmin && (
+                          <td className="px-4 py-3">
+                            <button onClick={() => handlePromote(model.id)} disabled={model.status === 'Active'} className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50">
+                              Promote
+                            </button>
+                          </td>
+                        )}
+                      </tr>
+                    ))}
+                  {models.filter((model) => model.accuracy > 0 || model.rocAuc > 0 || model.f1Score > 0).length === 0 && (
+                    <tr>
+                      <td colSpan={isAdmin ? 8 : 7} className="px-4 py-6 text-center text-sm text-slate-400">
+                        No trained models with metrics yet. Train a model to see performance data.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </SectionCard>
+
+          <SectionCard title="Alerts" subtitle="Auto-generated alerts for audit and compliance" className="flex flex-1 flex-col">
+            <div className="flex flex-1 flex-col gap-3">
+              {alerts.length === 0 ? (
+                <div className="flex flex-1 items-center justify-center rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-center">
+                  <div>
+                    <p className="text-sm font-medium text-slate-700">No alerts yet</p>
+                    <p className="mt-1 text-xs text-slate-500">High-risk predictions and audit flags will appear here once the ML module detects records that need review.</p>
+                  </div>
+                </div>
+              ) : alerts.map((alert) => (
+                <div key={`${alert.source ?? 'alert'}-${alert.id}`} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                  <div className="flex items-start gap-3">
+                    <div className={`mt-1 h-2.5 w-2.5 rounded-full ${alert.severity === 'High' ? 'bg-red-500' : alert.severity === 'Medium' ? 'bg-amber-500' : 'bg-blue-500'}`} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between gap-3">
+                        <p className="font-medium text-slate-900">{alert.title}</p>
+                        <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${AlertStatusClass(alert.status)}`}>{alert.status}</span>
+                      </div>
+                      <p className="mt-1 text-xs text-slate-500">{alert.description}</p>
+                      <p className="mt-2 text-[11px] uppercase tracking-wider text-slate-400">{alert.category} · {formatDateTime(alert.createdAt)}</p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {isAdmin ? (
+                          <button onClick={() => void handleResolveAlert(alert.id)} className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100">
+                            Resolve
+                          </button>
+                        ) : null}
+                        <button onClick={() => void handleDismissAlert(alert.id)} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-white">
+                          Dismiss
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </SectionCard>
+        </div>
+
         {isAdmin && (
           <SectionCard
             title="Model Management"
             subtitle="Admin controls for dataset upload and active model switching"
+            className="h-full xl:col-span-3"
             action={<span className="text-xs font-semibold uppercase tracking-wider text-blue-700">Admin only</span>}
           >
             <div className="space-y-3">
               <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                  <div className="min-w-0 flex-1">
                     <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">ML Model Status</p>
-                    <p className="mt-1 text-sm font-medium text-slate-900">Model: {trainingStatus.currentModel || activeModel?.name || 'N/A'}</p>
+                    <p className="mt-1 text-sm font-medium text-slate-900">Selected Model: {focusedModel?.name ?? 'N/A'}</p>
+                    <p className="mt-1 break-all text-sm text-slate-600">Dataset: {selectedDatasetLabel}</p>
+                    <p className="mt-1 text-sm text-slate-600">Training Job Model: {trainingStatus.currentModel || 'N/A'}</p>
                     <p className="mt-1 text-sm text-slate-600">Status: {trainingStatus.status === 'training' ? 'Training...' : trainingStatus.status === 'queued' ? 'Queued' : trainingStatus.status === 'completed' ? 'Completed' : trainingStatus.status === 'failed' ? 'Failed' : 'Idle'}</p>
                     <p className="mt-1 text-sm text-slate-600">Progress: {trainingStatus.progress}%</p>
-                    <p className="mt-1 text-sm text-slate-600">Last Trained: {formatDateTime(trainingStatus.lastTrainedAt ?? activeModel?.lastTrainedAt)}</p>
+                    <p className="mt-1 text-sm text-slate-600">Last Trained: {formatDateTime(displayedLastTrainedAt)}</p>
                   </div>
-                  <div className="min-w-[220px] rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-sm">
-                    <p className="font-semibold uppercase tracking-wider text-slate-500">Current metrics</p>
+                  <div className="w-full min-w-0 rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-sm lg:w-[220px] lg:flex-none">
+                    <p className="font-semibold uppercase tracking-wider text-slate-500">Selected model metrics</p>
                     <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1">
-                      <span>Accuracy</span><span className="text-right font-medium text-slate-900">{percent((trainingStatus.accuracy ?? activeModel?.accuracy ?? 0) * 100)}</span>
-                      <span>Precision</span><span className="text-right font-medium text-slate-900">{percent((trainingStatus.precision ?? activeModel?.precision ?? 0) * 100)}</span>
-                      <span>Recall</span><span className="text-right font-medium text-slate-900">{percent((trainingStatus.recall ?? activeModel?.recall ?? 0) * 100)}</span>
-                      <span>F1</span><span className="text-right font-medium text-slate-900">{percent((trainingStatus.f1Score ?? activeModel?.f1Score ?? 0) * 100)}</span>
-                      <span>ROC AUC</span><span className="text-right font-medium text-slate-900">{percent((trainingStatus.rocAuc ?? activeModel?.rocAuc ?? 0) * 100)}</span>
+                      <span>Accuracy</span><span className="text-right font-medium text-slate-900">{percent(displayedMetrics.accuracy * 100)}</span>
+                      <span>Precision</span><span className="text-right font-medium text-slate-900">{percent(displayedMetrics.precision * 100)}</span>
+                      <span>Recall</span><span className="text-right font-medium text-slate-900">{percent(displayedMetrics.recall * 100)}</span>
+                      <span>F1</span><span className="text-right font-medium text-slate-900">{percent(displayedMetrics.f1Score * 100)}</span>
+                      <span>ROC AUC</span><span className="text-right font-medium text-slate-900">{percent(displayedMetrics.rocAuc * 100)}</span>
                     </div>
                   </div>
                 </div>
@@ -1281,35 +1471,6 @@ export default function AdminMlModule() {
           </SectionCard>
         )}
 
-        <SectionCard title="Alerts" subtitle="Auto-generated alerts for audit and compliance">
-          <div className="space-y-3">
-            {alerts.map((alert) => (
-              <div key={alert.id} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                <div className="flex items-start gap-3">
-                  <div className={`mt-1 h-2.5 w-2.5 rounded-full ${alert.severity === 'High' ? 'bg-red-500' : alert.severity === 'Medium' ? 'bg-amber-500' : 'bg-blue-500'}`} />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center justify-between gap-3">
-                      <p className="font-medium text-slate-900">{alert.title}</p>
-                      <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${AlertStatusClass(alert.status)}`}>{alert.status}</span>
-                    </div>
-                    <p className="mt-1 text-xs text-slate-500">{alert.description}</p>
-                    <p className="mt-2 text-[11px] uppercase tracking-wider text-slate-400">{alert.category} · {formatDateTime(alert.createdAt)}</p>
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      {isAdmin ? (
-                        <button onClick={() => void handleResolveAlert(alert.id)} className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100">
-                          Resolve
-                        </button>
-                      ) : null}
-                      <button onClick={() => handleDismissAlert(alert.id)} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-white">
-                        Dismiss
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ))}
-          </div>
-        </SectionCard>
       </div>
 
       <SectionCard title="Training History" subtitle="Recent retraining jobs and logs">
@@ -1323,6 +1484,7 @@ export default function AdminMlModule() {
                   <th className="px-4 py-3">Status</th>
                   <th className="px-4 py-3">Started</th>
                   <th className="px-4 py-3">Finished</th>
+                  {isAdmin ? <th className="px-4 py-3 text-right">Action</th> : null}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-200 bg-white">
@@ -1343,11 +1505,22 @@ export default function AdminMlModule() {
                       </td>
                       <td className="px-4 py-2 text-slate-600">{formatDateTime(item.startedAt)}</td>
                       <td className="px-4 py-2 text-slate-600">{formatDateTime(item.finishedAt)}</td>
+                      {isAdmin ? (
+                        <td className="px-4 py-2 text-right">
+                          <button
+                            onClick={() => void handleDeleteTrainingHistory(item)}
+                            disabled={deletingTrainingHistoryId === item.id || item.status === 'Queued' || item.status === 'Running' || item.status === 'Training'}
+                            className="rounded-lg border border-red-200 bg-red-50 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
+                          >
+                            {deletingTrainingHistoryId === item.id ? 'Deleting...' : 'Delete'}
+                          </button>
+                        </td>
+                      ) : null}
                     </tr>
                   ))
                 ) : (
                   <tr>
-                    <td colSpan={5} className="px-4 py-8 text-center text-slate-500">
+                    <td colSpan={isAdmin ? 6 : 5} className="px-4 py-8 text-center text-slate-500">
                       No training history available
                     </td>
                   </tr>

@@ -1,3 +1,4 @@
+import axios from 'axios'
 import api from './api'
 
 export type DashboardOverview = {
@@ -61,6 +62,7 @@ export type MlAlert = {
   createdAt: string
   propertyId: string
   severity: 'Low' | 'Medium' | 'High'
+  source?: 'stored' | 'derived'
 }
 
 export type TrainingHistoryItem = {
@@ -107,6 +109,7 @@ const emptyOverview: DashboardOverview = {
 
 const emptyModels: MlModelSummary[] = []
 const emptyPredictions: MlPredictionItem[] = []
+const emptyAlerts: MlAlert[] = []
 const emptyHistory: TrainingHistoryItem[] = []
 
 async function safeGet<T>(path: string, fallback: T): Promise<T> {
@@ -141,6 +144,21 @@ export async function getMlPredictions(): Promise<MlPredictionItem[]> {
   return safeGet('/ml/predictions', emptyPredictions)
 }
 
+export async function getMlAlerts(): Promise<MlAlert[]> {
+  try {
+    const response = await api.get('/ml/alerts')
+    const alerts = (response.data?.data ?? response.data ?? emptyAlerts) as MlAlert[]
+    return alerts.map((alert) => ({ ...alert, source: 'stored' as const }))
+  } catch (error) {
+    if (axios.isAxiosError(error) && (error.response?.status === 404 || error.response?.status === 500)) {
+      return emptyAlerts
+    }
+
+    console.error('[mlService] getMlAlerts failed:', error)
+    return emptyAlerts
+  }
+}
+
 export async function getMlExplanation(predictionId: number): Promise<MlExplanation> {
   const fallback: MlExplanation = {
     id: predictionId,
@@ -158,8 +176,22 @@ export async function createPrediction(payload: { propertyId: number; modelName?
   return safePost('/ml/predictions', payload)
 }
 
+export async function resolveMlAlert(alertId: number): Promise<MlAlert> {
+  const alert = await safePost<MlAlert>(`/ml/alerts/${alertId}/resolve`)
+  return { ...alert, source: 'stored' }
+}
+
+export async function dismissMlAlert(alertId: number): Promise<MlAlert> {
+  const alert = await safePost<MlAlert>(`/ml/alerts/${alertId}/dismiss`)
+  return { ...alert, source: 'stored' }
+}
+
 export async function trainModel(payload: { modelName: string; datasetName: string; parameters?: Record<string, unknown> }): Promise<TrainingHistoryItem> {
   return safePost('/ml/training', payload)
+}
+
+export async function promoteModel(modelId: number): Promise<{ id: number; name: string; status: 'Active' }> {
+  return safePost(`/ml/models/${modelId}/promote`)
 }
 
 export async function uploadDataset(file: File): Promise<DatasetUploadResult> {
@@ -194,6 +226,16 @@ export async function deleteDataset(storedAs: string): Promise<boolean> {
 
 export async function getTrainingHistory(): Promise<TrainingHistoryItem[]> {
   return safeGet('/ml/training/history', emptyHistory)
+}
+
+export async function deleteTrainingHistoryEntry(trainingHistoryId: number): Promise<boolean> {
+  try {
+    const response = await api.delete(`/ml/training/history/${trainingHistoryId}`)
+    return Boolean(response?.data?.success ?? response?.data?.data ?? true)
+  } catch (error) {
+    console.error(`[mlService] deleteTrainingHistoryEntry failed for ${trainingHistoryId}:`, error)
+    throw error
+  }
 }
 
 export async function getMlTrainingStatus(): Promise<MlTrainingStatus> {
