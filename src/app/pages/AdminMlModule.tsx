@@ -260,6 +260,10 @@ async function fetchMlChart<T>(path: string): Promise<MlChartResponse<T>> {
   try {
     const response = await api.get(path)
 
+    if (response.data && typeof response.data === 'object' && 'unavailable' in response.data && response.data.unavailable === true) {
+      return { data: null, unavailable: true }
+    }
+
     // Validate response has expected structure
     if (!response.data) {
       if (SHOULD_LOG_CHART_WARNINGS) {
@@ -269,6 +273,10 @@ async function fetchMlChart<T>(path: string): Promise<MlChartResponse<T>> {
     }
 
     const result = (response.data?.data ?? response.data) as T
+
+    if (result && typeof result === 'object' && 'unavailable' in (result as Record<string, unknown>) && (result as Record<string, unknown>).unavailable === true) {
+      return { data: null, unavailable: true }
+    }
 
     // Ensure result is not empty or null
     if (!result) {
