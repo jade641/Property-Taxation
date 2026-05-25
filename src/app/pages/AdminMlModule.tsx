@@ -222,6 +222,21 @@ function SectionCard({ title, subtitle, children, action, notice, className }: {
 
 type MlChartResponse<T> = { data: T | null; unavailable: boolean }
 type UploadedDataset = { fileName: string; storedAs: string; size: number; createdAt: string }
+type MlDatasetInsights = {
+  low: number
+  medium: number
+  high: number
+  totalPredictions: number
+  hasGroundTruth: boolean
+  evaluatedRows: number
+  accuracy: number
+  precision: number
+  recall: number
+  f1Score: number
+  rocAuc: number
+  bins: string[]
+  histogramCounts: number[]
+}
 
 const SHOULD_LOG_CHART_WARNINGS = import.meta.env.DEV
 const SHOULD_LOG_DASHBOARD_WARNINGS = import.meta.env.DEV
@@ -410,6 +425,7 @@ export default function AdminMlModule() {
   const [alerts, setAlerts] = useState<MlAlert[]>([])
   const [history, setHistory] = useState<TrainingHistoryItem[]>([])
   const [datasets, setDatasets] = useState<Array<{ fileName: string; storedAs: string; size: number; createdAt: string }>>([])
+  const [datasetInsights, setDatasetInsights] = useState<MlDatasetInsights | null>(null)
   const [artifactRiskDistribution, setArtifactRiskDistribution] = useState<Array<{ name: string; value: number }>>([])
   const [artifactHistogram, setArtifactHistogram] = useState<Array<{ name: string; value: number }>>([])
   const [artifactFeatureImportance, setArtifactFeatureImportance] = useState<Array<{ name: string; importance: number }>>([])
@@ -466,6 +482,10 @@ export default function AdminMlModule() {
   const reloadDashboardInsights = useCallback(async () => {
     try {
       setApiError(null)
+      setDatasetInsights(null)
+      setArtifactRiskDistribution([])
+      setArtifactHistogram([])
+      setArtifactFeatureImportance([])
       // Best-effort: clear server-side chart cache so retrains show fresh charts
       try {
         await api.post('/ml/chart/cache/clear')
@@ -491,20 +511,35 @@ export default function AdminMlModule() {
           : undefined) ?? nextModels.find((model) => model.isBestModel || model.status === 'Active') ?? nextModels[0]).name ?? ''
         : ''
       const datasetChartQuery = buildChartQuery(resolvedDatasetName, selectedModelName)
+      const hasSelectedDataset = Boolean(resolvedDatasetName)
 
       if (resolvedDatasetName !== datasetName) {
         setDatasetName(resolvedDatasetName)
       }
 
-      const [featureResult, riskResult, histogramResult] = await Promise.all([
+      const datasetInsightsPromise = hasSelectedDataset
+        ? fetchMlChart<MlDatasetInsights>(`/ml/dataset-insights${datasetChartQuery}`)
+        : Promise.resolve<MlChartResponse<MlDatasetInsights>>({ data: null, unavailable: false })
+      const riskPromise = hasSelectedDataset
+        ? Promise.resolve<MlChartResponse<{ low: number; medium: number; high: number }>>({ data: null, unavailable: false })
+        : fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetChartQuery}`)
+      const histogramPromise = hasSelectedDataset
+        ? Promise.resolve<MlChartResponse<{ bins: string[]; counts: number[] }>>({ data: null, unavailable: false })
+        : fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetChartQuery}`)
+
+      const [featureResult, datasetInsightsResult, riskResult, histogramResult] = await Promise.all([
         fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance' + (selectedModelName ? `?model_name=${encodeURIComponent(selectedModelName)}` : '')),
-        fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetChartQuery}`),
-        fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetChartQuery}`),
+        datasetInsightsPromise,
+        riskPromise,
+        histogramPromise,
       ])
 
-      const fallbackHighRiskCount = riskResult?.data && typeof riskResult.data.high === 'number'
-        ? riskResult.data.high
-        : 0
+      const datasetInsightsData = datasetInsightsResult?.data && typeof datasetInsightsResult.data.low === 'number'
+        ? datasetInsightsResult.data
+        : null
+
+      const fallbackHighRiskCount = datasetInsightsData?.high
+        ?? (riskResult?.data && typeof riskResult.data.high === 'number' ? riskResult.data.high : 0)
 
       setModels(nextModels ?? [])
       setPredictions(nextPredictions ?? [])
@@ -512,6 +547,7 @@ export default function AdminMlModule() {
       setHistory(nextHistory ?? [])
       setDatasets(availableDatasets)
       setTrainingStatus(nextStatus ?? { status: 'idle', progress: 0, currentModel: 'N/A' })
+      setDatasetInsights(datasetInsightsData)
 
       if (featureResult?.data?.features && Array.isArray(featureResult.data.features)) {
         setArtifactFeatureImportance(featureResult.data.features)
@@ -520,7 +556,13 @@ export default function AdminMlModule() {
       }
       setFeatureChartUnavailable(featureResult?.unavailable ?? true)
 
-      if (riskResult?.data && typeof riskResult.data.low === 'number' && typeof riskResult.data.medium === 'number' && typeof riskResult.data.high === 'number') {
+      if (datasetInsightsData) {
+        setArtifactRiskDistribution([
+          { name: 'Low', value: datasetInsightsData.low },
+          { name: 'Medium', value: datasetInsightsData.medium },
+          { name: 'High', value: datasetInsightsData.high },
+        ])
+      } else if (riskResult?.data && typeof riskResult.data.low === 'number' && typeof riskResult.data.medium === 'number' && typeof riskResult.data.high === 'number') {
         setArtifactRiskDistribution([
           { name: 'Low', value: riskResult.data.low },
           { name: 'Medium', value: riskResult.data.medium },
@@ -529,14 +571,16 @@ export default function AdminMlModule() {
       } else {
         setArtifactRiskDistribution([])
       }
-      setRiskChartUnavailable(riskResult?.unavailable ?? true)
+      setRiskChartUnavailable(hasSelectedDataset ? (datasetInsightsResult?.unavailable ?? true) : (riskResult?.unavailable ?? true))
 
-      if (histogramResult?.data && Array.isArray(histogramResult.data.bins) && Array.isArray(histogramResult.data.counts)) {
+      if (datasetInsightsData && Array.isArray(datasetInsightsData.bins) && Array.isArray(datasetInsightsData.histogramCounts)) {
+        setArtifactHistogram(datasetInsightsData.bins.map((bin, index) => ({ name: bin, value: datasetInsightsData.histogramCounts[index] ?? 0 })))
+      } else if (histogramResult?.data && Array.isArray(histogramResult.data.bins) && Array.isArray(histogramResult.data.counts)) {
         setArtifactHistogram(histogramResult.data.bins.map((bin, index) => ({ name: bin, value: histogramResult.data?.counts[index] ?? 0 })))
       } else {
         setArtifactHistogram([])
       }
-      setHistogramChartUnavailable(histogramResult?.unavailable ?? true)
+      setHistogramChartUnavailable(hasSelectedDataset ? (datasetInsightsResult?.unavailable ?? true) : (histogramResult?.unavailable ?? true))
     } catch (error) {
       if (SHOULD_LOG_DASHBOARD_WARNINGS) {
         console.error('[Dashboard] Error refreshing insights:', error)
@@ -557,6 +601,10 @@ export default function AdminMlModule() {
     ;(async () => {
       try {
         setApiError(null)
+        setDatasetInsights(null)
+        setArtifactRiskDistribution([])
+        setArtifactHistogram([])
+        setArtifactFeatureImportance([])
         setLoading(true)
         // Fetch models first, then use them to build chart URLs with correct model_name
         const [initialModels, initialDatasets] = await Promise.all([getMlModels(), listDatasets()])
@@ -567,6 +615,7 @@ export default function AdminMlModule() {
         const resolvedDatasetNameLocal = resolveSelectedDatasetName(datasetName, initialDatasets)
         const selectedDatasetLabel = resolvedDatasetNameLocal || 'No dataset selected'
         const datasetChartQueryLocal = buildChartQuery(resolvedDatasetNameLocal, selectedModelNameLocal)
+        const hasSelectedDatasetLocal = Boolean(resolvedDatasetNameLocal)
 
         if (active) {
           setModels(initialModels)
@@ -587,18 +636,42 @@ export default function AdminMlModule() {
 
         // Fetch charts using selected model derived from the returned models
         try {
-          const [featureResult, riskResult, histogramResult] = await Promise.all([
+          const datasetInsightsPromise = hasSelectedDatasetLocal
+            ? fetchMlChart<MlDatasetInsights>(`/ml/dataset-insights${datasetChartQueryLocal}`)
+            : Promise.resolve<MlChartResponse<MlDatasetInsights>>({ data: null, unavailable: false })
+          const riskPromise = hasSelectedDatasetLocal
+            ? Promise.resolve<MlChartResponse<{ low: number; medium: number; high: number }>>({ data: null, unavailable: false })
+            : fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetChartQueryLocal}`)
+          const histogramPromise = hasSelectedDatasetLocal
+            ? Promise.resolve<MlChartResponse<{ bins: string[]; counts: number[] }>>({ data: null, unavailable: false })
+            : fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetChartQueryLocal}`)
+
+          const [featureResult, datasetInsightsResult, riskResult, histogramResult] = await Promise.all([
             fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance' + (selectedModelNameLocal ? `?model_name=${encodeURIComponent(selectedModelNameLocal)}` : '')),
-            fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetChartQueryLocal}`),
-            fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetChartQueryLocal}`),
+            datasetInsightsPromise,
+            riskPromise,
+            histogramPromise,
           ])
+
+          const datasetInsightsData = datasetInsightsResult?.data && typeof datasetInsightsResult.data.low === 'number'
+            ? datasetInsightsResult.data
+            : null
+
+          setDatasetInsights(datasetInsightsData)
 
           if (featureResult?.data?.features && Array.isArray(featureResult.data.features)) {
             setArtifactFeatureImportance(featureResult.data.features)
           }
           setFeatureChartUnavailable(featureResult?.unavailable ?? true)
 
-          if (riskResult?.data && typeof riskResult.data.low === 'number' && typeof riskResult.data.medium === 'number' && typeof riskResult.data.high === 'number') {
+          if (datasetInsightsData) {
+            fallbackHighRiskCount = datasetInsightsData.high
+            setArtifactRiskDistribution([
+              { name: 'Low', value: datasetInsightsData.low },
+              { name: 'Medium', value: datasetInsightsData.medium },
+              { name: 'High', value: datasetInsightsData.high },
+            ])
+          } else if (riskResult?.data && typeof riskResult.data.low === 'number' && typeof riskResult.data.medium === 'number' && typeof riskResult.data.high === 'number') {
             fallbackHighRiskCount = riskResult.data.high
             setArtifactRiskDistribution([
               { name: 'Low', value: riskResult.data.low },
@@ -608,15 +681,29 @@ export default function AdminMlModule() {
           } else {
             setArtifactRiskDistribution([])
           }
-          setRiskChartUnavailable(riskResult?.unavailable ?? true)
+          setRiskChartUnavailable(hasSelectedDatasetLocal ? (datasetInsightsResult?.unavailable ?? true) : (riskResult?.unavailable ?? true))
 
-          if (histogramResult?.data && Array.isArray(histogramResult.data.bins) && Array.isArray(histogramResult.data.counts)) {
+          if (datasetInsightsData && Array.isArray(datasetInsightsData.bins) && Array.isArray(datasetInsightsData.histogramCounts)) {
+            setArtifactHistogram(datasetInsightsData.bins.map((bin, index) => ({ name: bin, value: datasetInsightsData.histogramCounts[index] ?? 0 })))
+          } else if (histogramResult?.data && Array.isArray(histogramResult.data.bins) && Array.isArray(histogramResult.data.counts)) {
             setArtifactHistogram(histogramResult.data.bins.map((bin, index) => ({ name: bin, value: histogramResult.data?.counts[index] ?? 0 })))
           } else {
             setArtifactHistogram([])
           }
-          setHistogramChartUnavailable(histogramResult?.unavailable ?? true)
+          setHistogramChartUnavailable(hasSelectedDatasetLocal ? (datasetInsightsResult?.unavailable ?? true) : (histogramResult?.unavailable ?? true))
         } catch (error) {
+          setArtifactRiskDistribution([])
+          setArtifactHistogram([])
+          setArtifactFeatureImportance([])
+          setRiskChartUnavailable(true)
+          setHistogramChartUnavailable(true)
+          setFeatureChartUnavailable(true)
+          setArtifactRiskDistribution([])
+          setArtifactHistogram([])
+          setArtifactFeatureImportance([])
+          setRiskChartUnavailable(true)
+          setHistogramChartUnavailable(true)
+          setFeatureChartUnavailable(true)
           if (SHOULD_LOG_DASHBOARD_WARNINGS) {
             console.warn('[Dashboard] Error loading charts:', error instanceof Error ? error.message : 'Unknown error')
           }
@@ -711,14 +798,26 @@ export default function AdminMlModule() {
   const chartFeatureImportance = artifactFeatureImportance
   const focusedModel = selectedModel ?? activeModel
   const selectedDatasetLabel = datasetName.trim() || 'No dataset selected'
-  const selectedHighRiskCount = chartRiskDistribution.find((bucket) => bucket.name === 'High')?.value ?? 0
-  const displayedMetrics = {
-    accuracy: focusedModel?.accuracy ?? 0,
-    precision: focusedModel?.precision ?? 0,
-    recall: focusedModel?.recall ?? 0,
-    f1Score: focusedModel?.f1Score ?? 0,
-    rocAuc: focusedModel?.rocAuc ?? 0,
-  }
+  const selectedHighRiskCount = datasetInsights?.high ?? (chartRiskDistribution.find((bucket) => bucket.name === 'High')?.value ?? 0)
+  const datasetMetricsAvailable = Boolean(datasetInsights?.hasGroundTruth && datasetInsights.evaluatedRows > 0)
+  const displayedMetrics = datasetMetricsAvailable
+    ? {
+        accuracy: datasetInsights?.accuracy ?? 0,
+        precision: datasetInsights?.precision ?? 0,
+        recall: datasetInsights?.recall ?? 0,
+        f1Score: datasetInsights?.f1Score ?? 0,
+        rocAuc: datasetInsights?.rocAuc ?? 0,
+      }
+    : {
+        accuracy: focusedModel?.accuracy ?? 0,
+        precision: focusedModel?.precision ?? 0,
+        recall: focusedModel?.recall ?? 0,
+        f1Score: focusedModel?.f1Score ?? 0,
+        rocAuc: focusedModel?.rocAuc ?? 0,
+      }
+  const metricsSubtitle = datasetMetricsAvailable
+    ? `${selectedDatasetLabel} dataset evaluation`
+    : 'stored evaluation metric'
   const displayedLastTrainedAt = focusedModel?.lastTrainedAt ?? trainingStatus.lastTrainedAt
 
   // Training History pagination
@@ -993,9 +1092,9 @@ export default function AdminMlModule() {
 
       {!loading && (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <MetricCard title="Selected Model" value={focusedModel?.name ?? 'N/A'} subtitle={focusedModel ? `${percent(displayedMetrics.rocAuc * 100)} ROC AUC · stored evaluation metric` : 'No trained model available'} icon={Brain} />
-          <MetricCard title="High-Risk Records" value={selectedHighRiskCount.toLocaleString('en-PH')} subtitle={`For ${selectedDatasetLabel}`} icon={AlertTriangle} />
-          <MetricCard title="Selected F1 Score" value={focusedModel ? percent(displayedMetrics.f1Score * 100) : '—'} subtitle={focusedModel ? `${focusedModel.name} stored evaluation metric` : 'No selected model metrics'} icon={CheckCircle2} />
+          <MetricCard title="Selected Model" value={focusedModel?.name ?? 'N/A'} subtitle={focusedModel ? `${percent(displayedMetrics.rocAuc * 100)} ROC AUC · ${metricsSubtitle}` : 'No trained model available'} icon={Brain} />
+          <MetricCard title="High-Risk Records" value={selectedHighRiskCount.toLocaleString('en-PH')} subtitle={datasetInsights ? `${selectedDatasetLabel} · ${datasetInsights.totalPredictions.toLocaleString('en-PH')} rows scored` : `For ${selectedDatasetLabel}`} icon={AlertTriangle} />
+          <MetricCard title="Selected F1 Score" value={focusedModel ? percent(displayedMetrics.f1Score * 100) : '—'} subtitle={focusedModel ? `${focusedModel.name} ${metricsSubtitle}` : 'No selected model metrics'} icon={CheckCircle2} />
           <MetricCard title="Training Jobs" value={history.length.toLocaleString('en-PH')} subtitle="Recent training runs and status" icon={Database} />
         </div>
       )}
@@ -1226,13 +1325,14 @@ export default function AdminMlModule() {
                     <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">ML Model Status</p>
                     <p className="mt-1 text-sm font-medium text-slate-900">Selected Model: {focusedModel?.name ?? 'N/A'}</p>
                     <p className="mt-1 break-all text-sm text-slate-600">Dataset for live charts: {selectedDatasetLabel}</p>
+                    <p className="mt-1 text-sm text-slate-600">Metric Source: {metricsSubtitle}{datasetInsights?.evaluatedRows ? ` · ${datasetInsights.evaluatedRows.toLocaleString('en-PH')} labeled rows` : ''}</p>
                     <p className="mt-1 text-sm text-slate-600">Training Job Model: {trainingStatus.currentModel || 'N/A'}</p>
                     <p className="mt-1 text-sm text-slate-600">Status: {trainingStatus.status === 'training' ? 'Training...' : trainingStatus.status === 'queued' ? 'Queued' : trainingStatus.status === 'completed' ? 'Completed' : trainingStatus.status === 'failed' ? 'Failed' : 'Idle'}</p>
                     <p className="mt-1 text-sm text-slate-600">Progress: {trainingStatus.progress}%</p>
                     <p className="mt-1 text-sm text-slate-600">Last Trained: {formatDateTime(displayedLastTrainedAt)}</p>
                   </div>
                   <div className="w-full min-w-0 rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-sm lg:w-[220px] lg:flex-none">
-                    <p className="font-semibold uppercase tracking-wider text-slate-500">Stored model evaluation metrics</p>
+                    <p className="font-semibold uppercase tracking-wider text-slate-500">{datasetMetricsAvailable ? 'Dataset evaluation metrics' : 'Stored model evaluation metrics'}</p>
                     <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1">
                       <span>Accuracy</span><span className="text-right font-medium text-slate-900">{percent(displayedMetrics.accuracy * 100)}</span>
                       <span>Precision</span><span className="text-right font-medium text-slate-900">{percent(displayedMetrics.precision * 100)}</span>
