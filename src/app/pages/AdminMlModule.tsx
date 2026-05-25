@@ -409,14 +409,49 @@ async function buildChartFallbackFromCsv(file: File) {
 }
 
 type MlChartResponse<T> = { data: T | null; unavailable: boolean }
+type UploadedDataset = { fileName: string; storedAs: string; size: number; createdAt: string }
+
+const SHOULD_LOG_CHART_WARNINGS = import.meta.env.DEV
+
+function resolveSelectedDatasetName(requestedDatasetName: string, availableDatasets: UploadedDataset[]) {
+  const trimmed = requestedDatasetName.trim()
+  if (availableDatasets.length === 0) {
+    return trimmed
+  }
+
+  if (!trimmed) {
+    return availableDatasets[0].storedAs
+  }
+
+  const normalized = trimmed.toLowerCase()
+  const exactMatch = availableDatasets.find((dataset) => dataset.storedAs.toLowerCase() === normalized || dataset.fileName.toLowerCase() === normalized)
+  return exactMatch?.storedAs ?? availableDatasets[0].storedAs
+}
+
+function buildChartQuery(datasetName: string, modelName: string) {
+  const params = new URLSearchParams()
+
+  if (datasetName) {
+    params.set('dataset', datasetName)
+  }
+
+  if (modelName) {
+    params.set('model_name', modelName)
+  }
+
+  const query = params.toString()
+  return query ? `?${query}` : ''
+}
 
 async function fetchMlChart<T>(path: string): Promise<MlChartResponse<T>> {
   try {
-    const response = await api.get(path, { timeout: 5000 })
+    const response = await api.get(path)
 
     // Validate response has expected structure
     if (!response.data) {
-      console.warn(`[ML Chart] Empty response from ${path}`)
+      if (SHOULD_LOG_CHART_WARNINGS) {
+        console.warn(`[ML Chart] Empty response from ${path}`)
+      }
       return { data: null, unavailable: true }
     }
 
@@ -424,7 +459,9 @@ async function fetchMlChart<T>(path: string): Promise<MlChartResponse<T>> {
 
     // Ensure result is not empty or null
     if (!result) {
-      console.warn(`[ML Chart] Null/empty data from ${path}`)
+      if (SHOULD_LOG_CHART_WARNINGS) {
+        console.warn(`[ML Chart] Null/empty data from ${path}`)
+      }
       return { data: null, unavailable: true }
     }
 
@@ -433,17 +470,17 @@ async function fetchMlChart<T>(path: string): Promise<MlChartResponse<T>> {
       unavailable: false,
     }
   } catch (error) {
-    const isUnavailable = axios.isAxiosError(error) && (error.response?.status === 503 || error.code === 'ECONNABORTED')
-
-    if (isUnavailable) {
-      console.warn(`[ML Chart] Service unavailable for ${path}`)
-    } else if (axios.isAxiosError(error)) {
-      console.warn(`[ML Chart] Request failed for ${path}: ${error.status}`)
-    } else {
-      console.warn(`[ML Chart] Unexpected error for ${path}:`, error instanceof Error ? error.message : 'Unknown error')
+    if (SHOULD_LOG_CHART_WARNINGS) {
+      if (axios.isAxiosError(error) && (error.response?.status === 503 || error.code === 'ECONNABORTED')) {
+        console.warn(`[ML Chart] Service unavailable for ${path}`)
+      } else if (axios.isAxiosError(error)) {
+        console.warn(`[ML Chart] Request failed for ${path}: ${error.status}`)
+      } else {
+        console.warn(`[ML Chart] Unexpected error for ${path}:`, error instanceof Error ? error.message : 'Unknown error')
+      }
     }
 
-    return { data: null, unavailable: isUnavailable }
+    return { data: null, unavailable: true }
   }
 }
 
@@ -570,7 +607,7 @@ export default function AdminMlModule() {
   const [showRetrainModal, setShowRetrainModal] = useState(false)
   const [rawJsonVisible, setRawJsonVisible] = useState(false)
   const [selectedModelId, setSelectedModelId] = useState<number | null>(null)
-  const [datasetName, setDatasetName] = useState('propertytax_training_dataset.csv')
+  const [datasetName, setDatasetName] = useState('')
   const [trainingStatus, setTrainingStatus] = useState<MlTrainingStatus>({ status: 'idle', progress: 0, currentModel: 'N/A' })
   const [retrainRequestPending, setRetrainRequestPending] = useState(false)
   const [deletingTrainingHistoryId, setDeletingTrainingHistoryId] = useState<number | null>(null)
@@ -625,18 +662,24 @@ export default function AdminMlModule() {
         getMlTrainingStatus(),
       ])
 
-      const selectedDatasetLabel = datasetName.trim() || 'No dataset selected'
+      const availableDatasets = nextDatasets ?? []
+      const resolvedDatasetName = resolveSelectedDatasetName(datasetName, availableDatasets)
+      const selectedDatasetLabel = resolvedDatasetName || 'No dataset selected'
       const selectedModelName = (nextModels && nextModels.length > 0)
         ? ((selectedModelId !== null
           ? nextModels.find((model) => model.id === selectedModelId)
           : undefined) ?? nextModels.find((model) => model.isBestModel || model.status === 'Active') ?? nextModels[0]).name ?? ''
         : ''
-      const modelParam = selectedModelName ? `&model_name=${encodeURIComponent(selectedModelName)}` : ''
+      const datasetChartQuery = buildChartQuery(resolvedDatasetName, selectedModelName)
+
+      if (resolvedDatasetName !== datasetName) {
+        setDatasetName(resolvedDatasetName)
+      }
 
       const [featureResult, riskResult, histogramResult] = await Promise.all([
         fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance' + (selectedModelName ? `?model_name=${encodeURIComponent(selectedModelName)}` : '')),
-        fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}${modelParam}`),
-        fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}${modelParam}`),
+        fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetChartQuery}`),
+        fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetChartQuery}`),
       ])
 
       const fallbackHighRiskCount = riskResult?.data && typeof riskResult.data.high === 'number'
@@ -647,7 +690,7 @@ export default function AdminMlModule() {
       setPredictions(nextPredictions ?? [])
       setAlerts(buildAlertFeed(nextAlerts ?? [], nextPredictions ?? [], fallbackHighRiskCount, selectedDatasetLabel, selectedModelName))
       setHistory(nextHistory ?? [])
-      setDatasets(nextDatasets ?? [])
+      setDatasets(availableDatasets)
       setTrainingStatus(nextStatus ?? { status: 'idle', progress: 0, currentModel: 'N/A' })
 
       if (featureResult?.data?.features && Array.isArray(featureResult.data.features)) {
@@ -694,15 +737,22 @@ export default function AdminMlModule() {
         setApiError(null)
         setLoading(true)
         // Fetch models first, then use them to build chart URLs with correct model_name
-        const initialModels = await getMlModels()
+        const [initialModels, initialDatasets] = await Promise.all([getMlModels(), listDatasets()])
         const initialSelectedModel = (selectedModelId !== null
           ? initialModels.find((model) => model.id === selectedModelId)
           : undefined) ?? initialModels.find((model) => model.isBestModel || model.status === 'Active') ?? initialModels[0]
         const selectedModelNameLocal = initialSelectedModel?.name ?? ''
-        const modelParamLocal = selectedModelNameLocal ? `&model_name=${encodeURIComponent(selectedModelNameLocal)}` : ''
-        const selectedDatasetLabel = datasetName.trim() || 'No dataset selected'
+        const resolvedDatasetNameLocal = resolveSelectedDatasetName(datasetName, initialDatasets)
+        const selectedDatasetLabel = resolvedDatasetNameLocal || 'No dataset selected'
+        const datasetChartQueryLocal = buildChartQuery(resolvedDatasetNameLocal, selectedModelNameLocal)
 
-        if (active) setModels(initialModels)
+        if (active) {
+          setModels(initialModels)
+          setDatasets(initialDatasets)
+          if (resolvedDatasetNameLocal !== datasetName) {
+            setDatasetName(resolvedDatasetNameLocal)
+          }
+        }
 
         // Fetch predictions and history (models already fetched)
         const [nextPredictions, nextAlerts, nextHistory] = await Promise.all([getMlPredictions(), loadAlertsSafely(), getTrainingHistory()])
@@ -717,8 +767,8 @@ export default function AdminMlModule() {
         try {
           const [featureResult, riskResult, histogramResult] = await Promise.all([
             fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance' + (selectedModelNameLocal ? `?model_name=${encodeURIComponent(selectedModelNameLocal)}` : '')),
-            fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}${modelParamLocal}`),
-            fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetName ? `?dataset=${encodeURIComponent(datasetName)}` : ''}${modelParamLocal}`),
+            fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetChartQueryLocal}`),
+            fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetChartQueryLocal}`),
           ])
 
           if (featureResult?.data?.features && Array.isArray(featureResult.data.features)) {

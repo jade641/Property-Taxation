@@ -35,6 +35,7 @@ export const API_BASE_URL = normalizeApiBaseUrl(rawApiBaseUrl)
 console.log('API BASE URL:', API_BASE_URL)
 
 const API_TIMEOUT_MS = 30000 // 30 seconds to allow Render spin-up
+const SHOULD_LOG_RETRY_WARNINGS = import.meta.env.DEV
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -86,10 +87,12 @@ api.interceptors.response.use(
         config._retryCount += 1
         const delay = RETRY_DELAY_MS * config._retryCount
 
-        console.warn(
-          `[API] Request to ${config.url || ''} failed (${error.message || 'Error code: ' + (error.code || 'unknown')}). ` +
-          `Render backend might be sleeping. Waking up and retrying in ${delay}ms... (Attempt ${config._retryCount}/${MAX_RETRIES})`
-        );
+        if (SHOULD_LOG_RETRY_WARNINGS) {
+          console.warn(
+            `[API] Request to ${config.url || ''} failed (${error.message || 'Error code: ' + (error.code || 'unknown')}). ` +
+            `Render backend might be sleeping. Waking up and retrying in ${delay}ms... (Attempt ${config._retryCount}/${MAX_RETRIES})`
+          )
+        }
 
         await new Promise((resolve) => setTimeout(resolve, delay))
 
