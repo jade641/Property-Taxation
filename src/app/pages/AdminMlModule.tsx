@@ -58,10 +58,6 @@ function percent(value: number) {
   return `${value.toFixed(2)}%`
 }
 
-function normalizeModelKey(value?: string | null) {
-  return (value ?? '').trim().toLowerCase()
-}
-
 function formatDate(value?: string | null) {
   if (!value) return 'N/A'
   const date = new Date(value)
@@ -224,194 +220,11 @@ function SectionCard({ title, subtitle, children, action, notice, className }: {
   )
 }
 
-function buildRiskDistribution(predictions: MlPredictionItem[]) {
-  const counts = { Low: 0, Medium: 0, High: 0 }
-  predictions.forEach((prediction) => {
-    counts[prediction.riskLevel] += 1
-  })
-
-  return [
-    { name: 'Low', value: counts.Low },
-    { name: 'Medium', value: counts.Medium },
-    { name: 'High', value: counts.High },
-  ].filter((entry) => entry.value > 0)
-}
-
-function buildHistogram(predictions: MlPredictionItem[]) {
-  const buckets = [
-    { name: '0-20%', value: 0 },
-    { name: '21-40%', value: 0 },
-    { name: '41-60%', value: 0 },
-    { name: '61-80%', value: 0 },
-    { name: '81-100%', value: 0 },
-  ]
-
-  predictions.forEach((prediction) => {
-    const score = prediction.probabilityScore
-    if (score <= 20) buckets[0].value += 1
-    else if (score <= 40) buckets[1].value += 1
-    else if (score <= 60) buckets[2].value += 1
-    else if (score <= 80) buckets[3].value += 1
-    else buckets[4].value += 1
-  })
-
-  return buckets.filter((bucket) => bucket.value > 0)
-}
-
-function parseCsvLine(line: string) {
-  const values: string[] = []
-  let current = ''
-  let inQuotes = false
-
-  for (let i = 0; i < line.length; i += 1) {
-    const char = line[i]
-
-    if (char === '"') {
-      if (inQuotes && line[i + 1] === '"') {
-        current += '"'
-        i += 1
-      } else {
-        inQuotes = !inQuotes
-      }
-      continue
-    }
-
-    if (char === ',' && !inQuotes) {
-      values.push(current.trim())
-      current = ''
-      continue
-    }
-
-    current += char
-  }
-
-  values.push(current.trim())
-  return values
-}
-
-async function buildChartFallbackFromCsv(file: File) {
-  const fallbackRisk = [
-    { name: 'Low', value: 0 },
-    { name: 'Medium', value: 0 },
-    { name: 'High', value: 0 },
-  ]
-  const histogram = [
-    { name: '0-20%', value: 0 },
-    { name: '21-40%', value: 0 },
-    { name: '41-60%', value: 0 },
-    { name: '61-80%', value: 0 },
-    { name: '81-100%', value: 0 },
-  ]
-
-  const text = await file.text()
-  const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0)
-  if (lines.length < 2) {
-    return {
-      riskDistribution: [{ name: 'Medium', value: 1 }],
-      probabilityHistogram: [{ name: '41-60%', value: 1 }],
-      featureImportance: [{ name: 'Uploaded rows', importance: 100 }],
-    }
-  }
-
-  const headers = parseCsvLine(lines[0]).map((h) => h.toLowerCase())
-  const rows = lines.slice(1).map(parseCsvLine)
-
-  const getIndex = (names: string[]) => headers.findIndex((header) => names.includes(header))
-  const riskIndex = getIndex(['risklevel', 'risk_level', 'risk'])
-  const probIndex = getIndex(['probability', 'probabilityscore', 'probability_score', 'late_probability', 'predicted_probability'])
-  const labelIndex = getIndex(['prediction', 'predicted_label', 'is_late_payment', 'late_payment', 'label'])
-
-  const parseProbability = (raw: string) => {
-    const parsed = Number(raw)
-    if (Number.isNaN(parsed)) return null
-    const score = parsed <= 1 ? parsed * 100 : parsed
-    return Math.max(0, Math.min(100, score))
-  }
-
-  const riskKeyFromLabel = (raw: string) => {
-    const normalized = raw.trim().toLowerCase()
-    if (['high', 'late', '1', 'true'].includes(normalized)) return 'High'
-    if (['medium', 'mid'].includes(normalized)) return 'Medium'
-    if (['low', 'on-time', 'ontime', '0', 'false'].includes(normalized)) return 'Low'
-    return null
-  }
-
-  const probabilities: number[] = []
-  let low = 0
-  let medium = 0
-  let high = 0
-
-  rows.forEach((row) => {
-    let assigned = false
-
-    if (riskIndex >= 0) {
-      const risk = riskKeyFromLabel(row[riskIndex] ?? '')
-      if (risk === 'High') high += 1
-      else if (risk === 'Medium') medium += 1
-      else if (risk === 'Low') low += 1
-      assigned = Boolean(risk)
-    }
-
-    const probability = probIndex >= 0 ? parseProbability(row[probIndex] ?? '') : null
-    if (probability !== null) {
-      probabilities.push(probability)
-      if (!assigned) {
-        if (probability >= 80) high += 1
-        else if (probability >= 50) medium += 1
-        else low += 1
-        assigned = true
-      }
-    }
-
-    if (!assigned && labelIndex >= 0) {
-      const labelRisk = riskKeyFromLabel(row[labelIndex] ?? '')
-      if (labelRisk === 'High') high += 1
-      else if (labelRisk === 'Medium') medium += 1
-      else if (labelRisk === 'Low') low += 1
-      assigned = Boolean(labelRisk)
-    }
-
-    if (!assigned) {
-      medium += 1
-    }
-  })
-
-  fallbackRisk[0].value = low
-  fallbackRisk[1].value = medium
-  fallbackRisk[2].value = high
-
-  probabilities.forEach((score) => {
-    if (score <= 20) histogram[0].value += 1
-    else if (score <= 40) histogram[1].value += 1
-    else if (score <= 60) histogram[2].value += 1
-    else if (score <= 80) histogram[3].value += 1
-    else histogram[4].value += 1
-  })
-
-  if (probabilities.length === 0) {
-    histogram[2].value = rows.length
-  }
-
-  const nonEmptyCount = rows.reduce((count, row) => count + row.filter((cell) => String(cell ?? '').trim() !== '').length, 0)
-  const totalCells = Math.max(1, rows.length * Math.max(headers.length, 1))
-  const completeness = Math.round((nonEmptyCount / totalCells) * 100)
-  const featureImportance = [
-    { name: 'Rows parsed', importance: Math.min(100, Math.max(1, rows.length)) },
-    { name: 'Columns detected', importance: Math.min(100, Math.max(1, headers.length * 5)) },
-    { name: 'Data completeness', importance: Math.min(100, Math.max(1, completeness)) },
-  ]
-
-  return {
-    riskDistribution: fallbackRisk.filter((entry) => entry.value > 0),
-    probabilityHistogram: histogram.filter((entry) => entry.value > 0),
-    featureImportance,
-  }
-}
-
 type MlChartResponse<T> = { data: T | null; unavailable: boolean }
 type UploadedDataset = { fileName: string; storedAs: string; size: number; createdAt: string }
 
 const SHOULD_LOG_CHART_WARNINGS = import.meta.env.DEV
+const SHOULD_LOG_DASHBOARD_WARNINGS = import.meta.env.DEV
 
 function resolveSelectedDatasetName(requestedDatasetName: string, availableDatasets: UploadedDataset[]) {
   const trimmed = requestedDatasetName.trim()
@@ -589,9 +402,6 @@ export default function AdminMlModule() {
   const [alerts, setAlerts] = useState<MlAlert[]>([])
   const [history, setHistory] = useState<TrainingHistoryItem[]>([])
   const [datasets, setDatasets] = useState<Array<{ fileName: string; storedAs: string; size: number; createdAt: string }>>([])
-  const [uploadedRiskDistribution, setUploadedRiskDistribution] = useState<Array<{ name: string; value: number }>>([])
-  const [uploadedProbabilityHistogram, setUploadedProbabilityHistogram] = useState<Array<{ name: string; value: number }>>([])
-  const [uploadedFeatureImportance, setUploadedFeatureImportance] = useState<Array<{ name: string; importance: number }>>([])
   const [artifactRiskDistribution, setArtifactRiskDistribution] = useState<Array<{ name: string; value: number }>>([])
   const [artifactHistogram, setArtifactHistogram] = useState<Array<{ name: string; value: number }>>([])
   const [artifactFeatureImportance, setArtifactFeatureImportance] = useState<Array<{ name: string; importance: number }>>([])
@@ -638,7 +448,9 @@ export default function AdminMlModule() {
     try {
       return await getMlAlerts()
     } catch (error) {
-      console.warn('[Dashboard] Error loading alerts:', error instanceof Error ? error.message : 'Unknown error')
+      if (SHOULD_LOG_DASHBOARD_WARNINGS) {
+        console.warn('[Dashboard] Error loading alerts:', error instanceof Error ? error.message : 'Unknown error')
+      }
       return [] as MlAlert[]
     }
   }, [])
@@ -718,7 +530,9 @@ export default function AdminMlModule() {
       }
       setHistogramChartUnavailable(histogramResult?.unavailable ?? true)
     } catch (error) {
-      console.error('[Dashboard] Error refreshing insights:', error)
+      if (SHOULD_LOG_DASHBOARD_WARNINGS) {
+        console.error('[Dashboard] Error refreshing insights:', error)
+      }
       let msg = 'Failed to connect to the Machine Learning API. The server may be sleeping or starting up.'
       if (axios.isAxiosError(error) && error.message) {
         msg = `Connection Error: ${error.message}`
@@ -795,14 +609,18 @@ export default function AdminMlModule() {
           }
           setHistogramChartUnavailable(histogramResult?.unavailable ?? true)
         } catch (error) {
-          console.warn('[Dashboard] Error loading charts:', error instanceof Error ? error.message : 'Unknown error')
+          if (SHOULD_LOG_DASHBOARD_WARNINGS) {
+            console.warn('[Dashboard] Error loading charts:', error instanceof Error ? error.message : 'Unknown error')
+          }
         }
 
         if (!active) return
         setAlerts(buildAlertFeed(nextAlerts ?? [], nextPredictions ?? [], fallbackHighRiskCount, selectedDatasetLabel, selectedModelNameLocal))
       } catch (error) {
         if (!active) return
-        console.error('[Dashboard] Error loading initial ML data:', error)
+        if (SHOULD_LOG_DASHBOARD_WARNINGS) {
+          console.error('[Dashboard] Error loading initial ML data:', error)
+        }
         let msg = 'Failed to connect to the Machine Learning API. The server may be sleeping or starting up.'
         if (axios.isAxiosError(error) && error.message) {
           msg = `Connection Error: ${error.message}`
@@ -822,7 +640,9 @@ export default function AdminMlModule() {
       .then((items) => { if (active) setDatasets(items ?? []) })
       .catch((error) => {
         if (active) {
-          console.warn('[Dashboard] Error loading datasets:', error instanceof Error ? error.message : 'Unknown error')
+          if (SHOULD_LOG_DASHBOARD_WARNINGS) {
+            console.warn('[Dashboard] Error loading datasets:', error instanceof Error ? error.message : 'Unknown error')
+          }
           setDatasets([])
         }
       })
@@ -876,55 +696,22 @@ export default function AdminMlModule() {
   const activeModel = models.find((model) => model.status === 'Active') ?? models[0]
   const modelSelectorOptions = (models.length > 0 ? models : DEFAULT_MODEL_OPTIONS)
     .filter((m) => m.accuracy > 0 || m.rocAuc > 0 || m.f1Score > 0 || DEFAULT_MODEL_OPTIONS.some((d) => d.name === m.name))
-  const explanationFeatureImportance = useMemo(
-    () => (selectedExplanation?.factors ?? []).map((factor) => ({ name: factor.name, importance: factor.impact })),
-    [selectedExplanation],
-  )
   const resolvedSelectedModelId = selectedModelId ?? (modelSelectorOptions.find((option) => option.isBestModel || option.status === 'Active') ?? modelSelectorOptions[0])?.id ?? null
   const selectedModel = modelSelectorOptions.find((option) => option.id === resolvedSelectedModelId)
-  const chartRiskDistribution = artifactRiskDistribution.length > 0
-    ? artifactRiskDistribution
-    : riskChartUnavailable
-      ? (uploadedRiskDistribution.length > 0
-        ? uploadedRiskDistribution
-        : (predictions.length > 0
-          ? buildRiskDistribution(predictions)
-          : []))
-      : []
-  const chartProbabilityHistogram = artifactHistogram.length > 0
-    ? artifactHistogram
-    : histogramChartUnavailable
-      ? (uploadedProbabilityHistogram.length > 0
-        ? uploadedProbabilityHistogram
-        : (predictions.length > 0
-          ? buildHistogram(predictions)
-          : []))
-      : []
-  const chartFeatureImportance = artifactFeatureImportance.length > 0
-    ? artifactFeatureImportance
-    : featureChartUnavailable
-      ? (uploadedFeatureImportance.length > 0
-        ? uploadedFeatureImportance
-        : explanationFeatureImportance.length > 0
-          ? explanationFeatureImportance
-          : [])
-      : []
+  const chartRiskDistribution = artifactRiskDistribution
+  const chartProbabilityHistogram = artifactHistogram
+  const chartFeatureImportance = artifactFeatureImportance
   const focusedModel = selectedModel ?? activeModel
   const selectedDatasetLabel = datasetName.trim() || 'No dataset selected'
   const selectedHighRiskCount = chartRiskDistribution.find((bucket) => bucket.name === 'High')?.value ?? 0
-  const trainingMetricsMatchFocusedModel = normalizeModelKey(trainingStatus.currentModel) !== ''
-    && normalizeModelKey(trainingStatus.currentModel) !== 'n/a'
-    && normalizeModelKey(trainingStatus.currentModel) === normalizeModelKey(focusedModel?.name)
   const displayedMetrics = {
-    accuracy: trainingMetricsMatchFocusedModel ? (trainingStatus.accuracy ?? focusedModel?.accuracy ?? 0) : (focusedModel?.accuracy ?? 0),
-    precision: trainingMetricsMatchFocusedModel ? (trainingStatus.precision ?? focusedModel?.precision ?? 0) : (focusedModel?.precision ?? 0),
-    recall: trainingMetricsMatchFocusedModel ? (trainingStatus.recall ?? focusedModel?.recall ?? 0) : (focusedModel?.recall ?? 0),
-    f1Score: trainingMetricsMatchFocusedModel ? (trainingStatus.f1Score ?? focusedModel?.f1Score ?? 0) : (focusedModel?.f1Score ?? 0),
-    rocAuc: trainingMetricsMatchFocusedModel ? (trainingStatus.rocAuc ?? focusedModel?.rocAuc ?? 0) : (focusedModel?.rocAuc ?? 0),
+    accuracy: focusedModel?.accuracy ?? 0,
+    precision: focusedModel?.precision ?? 0,
+    recall: focusedModel?.recall ?? 0,
+    f1Score: focusedModel?.f1Score ?? 0,
+    rocAuc: focusedModel?.rocAuc ?? 0,
   }
-  const displayedLastTrainedAt = trainingMetricsMatchFocusedModel
-    ? (trainingStatus.lastTrainedAt ?? focusedModel?.lastTrainedAt)
-    : focusedModel?.lastTrainedAt
+  const displayedLastTrainedAt = focusedModel?.lastTrainedAt ?? trainingStatus.lastTrainedAt
 
   // Training History pagination
   const itemsPerPage = 8
@@ -998,15 +785,10 @@ export default function AdminMlModule() {
     const result = await uploadDataset(file)
     pushToast(result.success ? 'Dataset uploaded' : 'Upload failed', result.message, result.success ? 'emerald' : 'red')
     if (result.success) {
-      // refresh dataset list and set dataset name to uploaded file
       try {
         const items = await listDatasets()
         setDatasets(items)
         setDatasetName(result.storedAs ?? file.name)
-        const chartFallback = await buildChartFallbackFromCsv(file)
-        setUploadedRiskDistribution(chartFallback.riskDistribution)
-        setUploadedProbabilityHistogram(chartFallback.probabilityHistogram)
-        setUploadedFeatureImportance(chartFallback.featureImportance)
       } catch {
         // ignore
       }
@@ -1203,9 +985,9 @@ export default function AdminMlModule() {
 
       {!loading && (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
-          <MetricCard title="Selected Model" value={focusedModel?.name ?? 'N/A'} subtitle={focusedModel ? `${selectedDatasetLabel} · ${percent(displayedMetrics.rocAuc * 100)} ROC AUC` : 'No trained model available'} icon={Brain} />
+          <MetricCard title="Selected Model" value={focusedModel?.name ?? 'N/A'} subtitle={focusedModel ? `${percent(displayedMetrics.rocAuc * 100)} ROC AUC · stored evaluation metric` : 'No trained model available'} icon={Brain} />
           <MetricCard title="High-Risk Records" value={selectedHighRiskCount.toLocaleString('en-PH')} subtitle={`For ${selectedDatasetLabel}`} icon={AlertTriangle} />
-          <MetricCard title="Selected F1 Score" value={focusedModel ? percent(displayedMetrics.f1Score * 100) : '—'} subtitle={focusedModel ? `${focusedModel.name} metrics for the current selection` : 'No selected model metrics'} icon={CheckCircle2} />
+          <MetricCard title="Selected F1 Score" value={focusedModel ? percent(displayedMetrics.f1Score * 100) : '—'} subtitle={focusedModel ? `${focusedModel.name} stored evaluation metric` : 'No selected model metrics'} icon={CheckCircle2} />
           <MetricCard title="Training Jobs" value={history.length.toLocaleString('en-PH')} subtitle="Recent training runs and status" icon={Database} />
         </div>
       )}
@@ -1214,7 +996,7 @@ export default function AdminMlModule() {
         <SectionCard
           title="Risk Distribution"
           subtitle="Low / medium / high risk forecast mix"
-          notice={riskChartUnavailable ? (chartRiskDistribution.length > 0 ? 'ML service unavailable — showing fallback data' : 'ML service unavailable') : undefined}
+          notice={riskChartUnavailable ? 'ML service unavailable' : undefined}
         >
           <div className="h-72 relative">
             {riskChartUnavailable && chartRiskDistribution.length === 0 ? (
@@ -1250,7 +1032,7 @@ export default function AdminMlModule() {
         <SectionCard
           title="Probability Histogram"
           subtitle="Distribution of late-payment risk scores"
-          notice={histogramChartUnavailable ? (chartProbabilityHistogram.length > 0 ? 'ML service unavailable — showing fallback data' : 'ML service unavailable') : undefined}
+          notice={histogramChartUnavailable ? 'ML service unavailable' : undefined}
         >
           <div className="h-72 relative">
             {histogramChartUnavailable && chartProbabilityHistogram.length === 0 ? (
@@ -1286,7 +1068,7 @@ export default function AdminMlModule() {
         <SectionCard
           title="Feature Importance"
           subtitle="Top contributing drivers for the current explanation"
-          notice={featureChartUnavailable ? (chartFeatureImportance.length > 0 ? 'ML service unavailable — showing fallback data' : 'ML service unavailable') : undefined}
+          notice={featureChartUnavailable ? 'ML service unavailable' : undefined}
         >
           <div className="h-72 relative">
             {featureChartUnavailable && chartFeatureImportance.length === 0 ? (
@@ -1435,14 +1217,14 @@ export default function AdminMlModule() {
                   <div className="min-w-0 flex-1">
                     <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">ML Model Status</p>
                     <p className="mt-1 text-sm font-medium text-slate-900">Selected Model: {focusedModel?.name ?? 'N/A'}</p>
-                    <p className="mt-1 break-all text-sm text-slate-600">Dataset: {selectedDatasetLabel}</p>
+                    <p className="mt-1 break-all text-sm text-slate-600">Dataset for live charts: {selectedDatasetLabel}</p>
                     <p className="mt-1 text-sm text-slate-600">Training Job Model: {trainingStatus.currentModel || 'N/A'}</p>
                     <p className="mt-1 text-sm text-slate-600">Status: {trainingStatus.status === 'training' ? 'Training...' : trainingStatus.status === 'queued' ? 'Queued' : trainingStatus.status === 'completed' ? 'Completed' : trainingStatus.status === 'failed' ? 'Failed' : 'Idle'}</p>
                     <p className="mt-1 text-sm text-slate-600">Progress: {trainingStatus.progress}%</p>
                     <p className="mt-1 text-sm text-slate-600">Last Trained: {formatDateTime(displayedLastTrainedAt)}</p>
                   </div>
                   <div className="w-full min-w-0 rounded-xl border border-slate-200 bg-white p-3 text-xs text-slate-600 shadow-sm lg:w-[220px] lg:flex-none">
-                    <p className="font-semibold uppercase tracking-wider text-slate-500">Selected model metrics</p>
+                    <p className="font-semibold uppercase tracking-wider text-slate-500">Stored model evaluation metrics</p>
                     <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1">
                       <span>Accuracy</span><span className="text-right font-medium text-slate-900">{percent(displayedMetrics.accuracy * 100)}</span>
                       <span>Precision</span><span className="text-right font-medium text-slate-900">{percent(displayedMetrics.precision * 100)}</span>
