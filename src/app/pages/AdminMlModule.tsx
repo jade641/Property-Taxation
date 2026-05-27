@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ElementType, type ReactNode } from 'react'
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ElementType, type ReactNode } from 'react'
 import axios from 'axios'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -32,6 +32,7 @@ import { exportCsv } from '../services/exportService'
 import {
   deleteTrainingHistoryEntry,
   dismissMlAlert,
+  getMlDatasetAnalysis,
   getMlExplanation,
   getMlAlerts,
   getMlModels,
@@ -45,6 +46,9 @@ import {
   listDatasets,
   deleteDataset,
   type MlAlert,
+  type MlDatasetAnalysis,
+  type MlDatasetInsights,
+  type MlDatasetPredictionItem,
   type MlExplanation,
   type MlModelSummary,
   type MlPredictionItem,
@@ -204,6 +208,59 @@ function MetricCard({ title, value, subtitle, icon: Icon }: { title: string; val
   )
 }
 
+function PredictionSummaryCard({
+  label,
+  value,
+  subtitle,
+  tone,
+}: {
+  label: string
+  value: string
+  subtitle: string
+  tone: 'blue' | 'red' | 'amber' | 'emerald'
+}) {
+  const toneClasses = tone === 'red'
+    ? 'border-red-200 bg-red-50/80'
+    : tone === 'amber'
+      ? 'border-amber-200 bg-amber-50/80'
+      : tone === 'emerald'
+        ? 'border-emerald-200 bg-emerald-50/80'
+        : 'border-blue-200 bg-blue-50/80'
+
+  const labelClasses = tone === 'red'
+    ? 'text-red-700'
+    : tone === 'amber'
+      ? 'text-amber-700'
+      : tone === 'emerald'
+        ? 'text-emerald-700'
+        : 'text-blue-700'
+
+  return (
+    <div className={`rounded-2xl border p-4 shadow-sm ${toneClasses}`}>
+      <p className={`text-[11px] font-semibold uppercase tracking-[0.18em] ${labelClasses}`}>{label}</p>
+      <p className="mt-3 text-2xl font-semibold tracking-tight text-slate-900">{value}</p>
+      <p className="mt-1 text-xs leading-5 text-slate-600">{subtitle}</p>
+    </div>
+  )
+}
+
+function UnavailableChartState({ title, message, onRetry }: { title: string; message: string; onRetry: () => void }) {
+  return (
+    <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl border border-slate-200 bg-slate-50 p-6 text-center">
+      <AlertTriangle className="mb-2 h-8 w-8 text-amber-500 animate-bounce" />
+      <p className="text-sm font-medium text-slate-800">{title}</p>
+      <p className="mt-1 max-w-[220px] text-xs text-slate-500">{message}</p>
+      <button
+        onClick={onRetry}
+        className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 shadow-sm hover:bg-slate-50"
+      >
+        <RefreshCcw className="h-3 w-3" />
+        Retry Chart
+      </button>
+    </div>
+  )
+}
+
 function SectionCard({ title, subtitle, children, action, notice, className }: { title: string; subtitle: string; children: ReactNode; action?: ReactNode; notice?: ReactNode; className?: string }) {
   return (
     <section className={`rounded-2xl border border-slate-200 bg-white p-5 shadow-sm${className ? ` ${className}` : ''}`}>
@@ -222,24 +279,64 @@ function SectionCard({ title, subtitle, children, action, notice, className }: {
 
 type MlChartResponse<T> = { data: T | null; unavailable: boolean }
 type UploadedDataset = { fileName: string; storedAs: string; size: number; createdAt: string }
-type MlDatasetInsights = {
-  low: number
-  medium: number
-  high: number
-  totalPredictions: number
-  hasGroundTruth: boolean
-  evaluatedRows: number
-  accuracy: number
-  precision: number
-  recall: number
-  f1Score: number
-  rocAuc: number
-  bins: string[]
-  histogramCounts: number[]
+type DashboardSnapshot = {
+  models: MlModelSummary[]
+  predictions: MlPredictionItem[]
+  alerts: MlAlert[]
+  history: TrainingHistoryItem[]
+  datasets: UploadedDataset[]
+  trainingStatus: MlTrainingStatus
+  datasetInsights: MlDatasetInsights | null
+  datasetPredictions: MlDatasetPredictionItem[]
+  datasetPredictionSkippedRows: number
+  artifactRiskDistribution: Array<{ name: string; value: number }>
+  artifactHistogram: Array<{ name: string; value: number }>
+  artifactFeatureImportance: Array<{ name: string; importance: number }>
+  riskChartUnavailable: boolean
+  histogramChartUnavailable: boolean
+  featureChartUnavailable: boolean
+  resolvedDatasetName: string
 }
+type DatasetPredictionRiskFilter = 'All' | MlDatasetPredictionItem['riskLevel']
+type DatasetPredictionSortMode = 'RiskDescending' | 'ScoreDescending' | 'PropertyAscending'
 
 const SHOULD_LOG_CHART_WARNINGS = import.meta.env.DEV
 const SHOULD_LOG_DASHBOARD_WARNINGS = import.meta.env.DEV
+const EMPTY_DATASET_ANALYSIS: MlDatasetAnalysis = { summary: null, predictions: [], skippedRows: 0 }
+const DEFAULT_TRAINING_STATUS: MlTrainingStatus = { status: 'idle', progress: 0, currentModel: 'N/A' }
+const DATASET_RISK_FILTER_OPTIONS: Array<{ value: DatasetPredictionRiskFilter; label: string }> = [
+  { value: 'All', label: 'All preview rows' },
+  { value: 'High', label: 'High risk' },
+  { value: 'Medium', label: 'Medium risk' },
+  { value: 'Low', label: 'Low risk' },
+]
+const DATASET_SORT_OPTIONS: Array<{ value: DatasetPredictionSortMode; label: string }> = [
+  { value: 'RiskDescending', label: 'Highest risk first' },
+  { value: 'ScoreDescending', label: 'Highest score first' },
+  { value: 'PropertyAscending', label: 'Property ID' },
+]
+
+function getDatasetPredictionKey(item: MlDatasetPredictionItem) {
+  return `${item.rowNumber}-${item.propertyId}-${item.owner}`
+}
+
+function getDatasetRiskWeight(riskLevel: MlDatasetPredictionItem['riskLevel']) {
+  if (riskLevel === 'High') return 3
+  if (riskLevel === 'Medium') return 2
+  return 1
+}
+
+function getDatasetRiskBadgeClass(riskLevel: MlDatasetPredictionItem['riskLevel']) {
+  if (riskLevel === 'High') return 'border border-red-100 bg-red-50 text-red-700'
+  if (riskLevel === 'Medium') return 'border border-amber-100 bg-amber-50 text-amber-700'
+  return 'border border-emerald-100 bg-emerald-50 text-emerald-700'
+}
+
+function getDatasetRiskMeterClass(riskLevel: MlDatasetPredictionItem['riskLevel']) {
+  if (riskLevel === 'High') return 'bg-red-500'
+  if (riskLevel === 'Medium') return 'bg-amber-500'
+  return 'bg-emerald-500'
+}
 
 function resolveSelectedDatasetName(requestedDatasetName: string, availableDatasets: UploadedDataset[]) {
   const trimmed = requestedDatasetName.trim()
@@ -320,52 +417,8 @@ async function fetchMlChart<T>(path: string): Promise<MlChartResponse<T>> {
   }
 }
 
-function buildAlertsFromPredictions(predictions: MlPredictionItem[]): MlAlert[] {
-  return predictions
-    .filter((prediction) => prediction.riskLevel === 'High')
-    .slice(0, 6)
-    .map((prediction) => ({
-      id: prediction.id,
-      title: 'High-risk property detected',
-      description: `${prediction.propertyId} owned by ${prediction.owner} was flagged by the live ML model.`,
-      category: 'High-risk',
-      status: 'Open',
-      createdAt: new Date().toISOString(),
-      propertyId: prediction.propertyId,
-      severity: 'High',
-      source: 'derived',
-    }))
-}
-
-function buildDatasetSummaryAlert(highRiskCount: number, datasetLabel: string, modelName: string): MlAlert[] {
-  if (highRiskCount <= 0) {
-    return []
-  }
-
-  return [{
-    id: -1,
-    title: 'High-risk records detected',
-    description: `${highRiskCount.toLocaleString('en-PH')} records from ${datasetLabel} were classified as high risk by ${modelName || 'the selected model'}.`,
-    category: 'High-risk',
-    status: 'Open',
-    createdAt: new Date().toISOString(),
-    propertyId: datasetLabel,
-    severity: 'High',
-    source: 'derived',
-  }]
-}
-
-function buildAlertFeed(storedAlerts: MlAlert[], predictions: MlPredictionItem[], highRiskCount: number, datasetLabel: string, modelName: string): MlAlert[] {
-  if (storedAlerts.length > 0) {
-    return storedAlerts
-  }
-
-  const predictionAlerts = buildAlertsFromPredictions(predictions)
-  if (predictionAlerts.length > 0) {
-    return predictionAlerts
-  }
-
-  return buildDatasetSummaryAlert(highRiskCount, datasetLabel, modelName)
+function buildAlertFeed(storedAlerts: MlAlert[]): MlAlert[] {
+  return storedAlerts
 }
 
 function buildAccountantExportRows(predictions: MlPredictionItem[]) {
@@ -426,6 +479,8 @@ export default function AdminMlModule() {
   const [history, setHistory] = useState<TrainingHistoryItem[]>([])
   const [datasets, setDatasets] = useState<Array<{ fileName: string; storedAs: string; size: number; createdAt: string }>>([])
   const [datasetInsights, setDatasetInsights] = useState<MlDatasetInsights | null>(null)
+  const [datasetPredictions, setDatasetPredictions] = useState<MlDatasetPredictionItem[]>([])
+  const [datasetPredictionSkippedRows, setDatasetPredictionSkippedRows] = useState(0)
   const [artifactRiskDistribution, setArtifactRiskDistribution] = useState<Array<{ name: string; value: number }>>([])
   const [artifactHistogram, setArtifactHistogram] = useState<Array<{ name: string; value: number }>>([])
   const [artifactFeatureImportance, setArtifactFeatureImportance] = useState<Array<{ name: string; importance: number }>>([])
@@ -434,14 +489,13 @@ export default function AdminMlModule() {
   const [featureChartUnavailable, setFeatureChartUnavailable] = useState(false)
   const [loading, setLoading] = useState(true)
   const [apiError, setApiError] = useState<string | null>(null)
-  const [selectedPrediction] = useState<MlPredictionItem | null>(null)
-  const [selectedExplanation, setSelectedExplanation] = useState<MlExplanation | null>(null)
-  const [showPredictionModal, setShowPredictionModal] = useState(false)
-  const [showExplanationModal, setShowExplanationModal] = useState(false)
   const [showRetrainModal, setShowRetrainModal] = useState(false)
-  const [rawJsonVisible, setRawJsonVisible] = useState(false)
   const [selectedModelId, setSelectedModelId] = useState<number | null>(null)
   const [datasetName, setDatasetName] = useState('')
+  const [datasetRiskFilter, setDatasetRiskFilter] = useState<DatasetPredictionRiskFilter>('All')
+  const [datasetSortMode, setDatasetSortMode] = useState<DatasetPredictionSortMode>('RiskDescending')
+  const [datasetPredictionQuery, setDatasetPredictionQuery] = useState('')
+  const [selectedDatasetPredictionKey, setSelectedDatasetPredictionKey] = useState<string | null>(null)
   const [trainingStatus, setTrainingStatus] = useState<MlTrainingStatus>({ status: 'idle', progress: 0, currentModel: 'N/A' })
   const [retrainRequestPending, setRetrainRequestPending] = useState(false)
   const [deletingTrainingHistoryId, setDeletingTrainingHistoryId] = useState<number | null>(null)
@@ -450,6 +504,7 @@ export default function AdminMlModule() {
   const fileInputRef = useRef<HTMLInputElement>(null)
   const toastIdRef = useRef(0)
   const trainingCompletionHandledRef = useRef(false)
+  const deferredDatasetPredictionQuery = useDeferredValue(datasetPredictionQuery)
 
   const pushToast = (title: string, message: string, tone: Toast['tone'] = 'blue') => {
     toastIdRef.current += 1
@@ -479,108 +534,141 @@ export default function AdminMlModule() {
     }
   }, [])
 
-  const reloadDashboardInsights = useCallback(async () => {
-    try {
-      setApiError(null)
-      setDatasetInsights(null)
-      setArtifactRiskDistribution([])
-      setArtifactHistogram([])
-      setArtifactFeatureImportance([])
-      // Best-effort: clear server-side chart cache so retrains show fresh charts
+  const resetVisualizationState = useCallback(() => {
+    setDatasetInsights(null)
+    setDatasetPredictions([])
+    setDatasetPredictionSkippedRows(0)
+    setArtifactRiskDistribution([])
+    setArtifactHistogram([])
+    setArtifactFeatureImportance([])
+    setRiskChartUnavailable(false)
+    setHistogramChartUnavailable(false)
+    setFeatureChartUnavailable(false)
+    setSelectedDatasetPredictionKey(null)
+  }, [])
+
+  const buildDashboardSnapshot = useCallback(async (options?: { clearCache?: boolean }): Promise<DashboardSnapshot> => {
+    if (options?.clearCache) {
       try {
         await api.post('/ml/chart/cache/clear')
       } catch {
         // ignore — cache clear is best-effort
       }
-      // Fetch core dashboard data first so we can derive the selected model from fresh results
-      const [nextModels, nextPredictions, nextAlerts, nextHistory, nextDatasets, nextStatus] = await Promise.all([
-        getMlModels(),
-        getMlPredictions(),
-        loadAlertsSafely(),
-        getTrainingHistory(),
-        listDatasets(),
-        getMlTrainingStatus(),
-      ])
+    }
 
-      const availableDatasets = nextDatasets ?? []
-      const resolvedDatasetName = resolveSelectedDatasetName(datasetName, availableDatasets)
-      const selectedDatasetLabel = resolvedDatasetName || 'No dataset selected'
-      const selectedModelName = (nextModels && nextModels.length > 0)
-        ? ((selectedModelId !== null
-          ? nextModels.find((model) => model.id === selectedModelId)
-          : undefined) ?? nextModels.find((model) => model.isBestModel || model.status === 'Active') ?? nextModels[0]).name ?? ''
-        : ''
-      const datasetChartQuery = buildChartQuery(resolvedDatasetName, selectedModelName)
-      const hasSelectedDataset = Boolean(resolvedDatasetName)
+    const [nextModels, nextPredictions, nextAlerts, nextHistory, nextDatasets, nextStatus] = await Promise.all([
+      getMlModels(),
+      getMlPredictions(),
+      loadAlertsSafely(),
+      getTrainingHistory(),
+      listDatasets(),
+      getMlTrainingStatus(),
+    ])
 
-      if (resolvedDatasetName !== datasetName) {
-        setDatasetName(resolvedDatasetName)
-      }
+    const availableDatasets = nextDatasets ?? []
+    const safePredictions = nextPredictions ?? []
+    const resolvedDatasetName = resolveSelectedDatasetName(datasetName, availableDatasets)
+    const selectedModelName = (nextModels && nextModels.length > 0)
+      ? ((selectedModelId !== null
+        ? nextModels.find((model) => model.id === selectedModelId)
+        : undefined) ?? nextModels.find((model) => model.isBestModel || model.status === 'Active') ?? nextModels[0]).name ?? ''
+      : ''
+    const datasetChartQuery = buildChartQuery(resolvedDatasetName, selectedModelName)
+    const hasSelectedDataset = Boolean(resolvedDatasetName)
 
-      const datasetInsightsPromise = hasSelectedDataset
-        ? fetchMlChart<MlDatasetInsights>(`/ml/dataset-insights${datasetChartQuery}`)
-        : Promise.resolve<MlChartResponse<MlDatasetInsights>>({ data: null, unavailable: false })
-      const riskPromise = hasSelectedDataset
-        ? Promise.resolve<MlChartResponse<{ low: number; medium: number; high: number }>>({ data: null, unavailable: false })
-        : fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetChartQuery}`)
-      const histogramPromise = hasSelectedDataset
-        ? Promise.resolve<MlChartResponse<{ bins: string[]; counts: number[] }>>({ data: null, unavailable: false })
-        : fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetChartQuery}`)
+    const datasetAnalysisPromise = hasSelectedDataset
+      ? getMlDatasetAnalysis(resolvedDatasetName, selectedModelName)
+      : Promise.resolve<MlDatasetAnalysis>(EMPTY_DATASET_ANALYSIS)
+    const riskPromise = hasSelectedDataset
+      ? Promise.resolve<MlChartResponse<{ low: number; medium: number; high: number }>>({ data: null, unavailable: false })
+      : fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetChartQuery}`)
+    const histogramPromise = hasSelectedDataset
+      ? Promise.resolve<MlChartResponse<{ bins: string[]; counts: number[] }>>({ data: null, unavailable: false })
+      : fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetChartQuery}`)
 
-      const [featureResult, datasetInsightsResult, riskResult, histogramResult] = await Promise.all([
-        fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance' + (selectedModelName ? `?model_name=${encodeURIComponent(selectedModelName)}` : '')),
-        datasetInsightsPromise,
-        riskPromise,
-        histogramPromise,
-      ])
+    const [featureResult, datasetAnalysisResult, riskResult, histogramResult] = await Promise.all([
+      fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance' + (selectedModelName ? `?model_name=${encodeURIComponent(selectedModelName)}` : '')),
+      datasetAnalysisPromise,
+      riskPromise,
+      histogramPromise,
+    ])
 
-      const datasetInsightsData = datasetInsightsResult?.data && typeof datasetInsightsResult.data.low === 'number'
-        ? datasetInsightsResult.data
-        : null
+    const datasetInsightsData = datasetAnalysisResult?.summary && typeof datasetAnalysisResult.summary.low === 'number'
+      ? datasetAnalysisResult.summary
+      : null
 
-      const fallbackHighRiskCount = datasetInsightsData?.high
-        ?? (riskResult?.data && typeof riskResult.data.high === 'number' ? riskResult.data.high : 0)
-
-      setModels(nextModels ?? [])
-      setPredictions(nextPredictions ?? [])
-      setAlerts(buildAlertFeed(nextAlerts ?? [], nextPredictions ?? [], fallbackHighRiskCount, selectedDatasetLabel, selectedModelName))
-      setHistory(nextHistory ?? [])
-      setDatasets(availableDatasets)
-      setTrainingStatus(nextStatus ?? { status: 'idle', progress: 0, currentModel: 'N/A' })
-      setDatasetInsights(datasetInsightsData)
-
-      if (featureResult?.data?.features && Array.isArray(featureResult.data.features)) {
-        setArtifactFeatureImportance(featureResult.data.features)
-      } else {
-        setArtifactFeatureImportance([])
-      }
-      setFeatureChartUnavailable(featureResult?.unavailable ?? true)
-
-      if (datasetInsightsData) {
-        setArtifactRiskDistribution([
+    const nextRiskDistribution = datasetInsightsData
+      ? [
           { name: 'Low', value: datasetInsightsData.low },
           { name: 'Medium', value: datasetInsightsData.medium },
           { name: 'High', value: datasetInsightsData.high },
-        ])
-      } else if (riskResult?.data && typeof riskResult.data.low === 'number' && typeof riskResult.data.medium === 'number' && typeof riskResult.data.high === 'number') {
-        setArtifactRiskDistribution([
-          { name: 'Low', value: riskResult.data.low },
-          { name: 'Medium', value: riskResult.data.medium },
-          { name: 'High', value: riskResult.data.high },
-        ])
-      } else {
-        setArtifactRiskDistribution([])
-      }
-      setRiskChartUnavailable(hasSelectedDataset ? (datasetInsightsResult?.unavailable ?? true) : (riskResult?.unavailable ?? true))
+        ]
+      : riskResult?.data && typeof riskResult.data.low === 'number' && typeof riskResult.data.medium === 'number' && typeof riskResult.data.high === 'number'
+        ? [
+            { name: 'Low', value: riskResult.data.low },
+            { name: 'Medium', value: riskResult.data.medium },
+            { name: 'High', value: riskResult.data.high },
+          ]
+        : []
 
-      if (datasetInsightsData && Array.isArray(datasetInsightsData.bins) && Array.isArray(datasetInsightsData.histogramCounts)) {
-        setArtifactHistogram(datasetInsightsData.bins.map((bin, index) => ({ name: bin, value: datasetInsightsData.histogramCounts[index] ?? 0 })))
-      } else if (histogramResult?.data && Array.isArray(histogramResult.data.bins) && Array.isArray(histogramResult.data.counts)) {
-        setArtifactHistogram(histogramResult.data.bins.map((bin, index) => ({ name: bin, value: histogramResult.data?.counts[index] ?? 0 })))
-      } else {
-        setArtifactHistogram([])
-      }
-      setHistogramChartUnavailable(hasSelectedDataset ? (datasetInsightsResult?.unavailable ?? true) : (histogramResult?.unavailable ?? true))
+    const nextHistogram = datasetInsightsData && Array.isArray(datasetInsightsData.bins) && Array.isArray(datasetInsightsData.histogramCounts)
+      ? datasetInsightsData.bins.map((bin, index) => ({ name: bin, value: datasetInsightsData.histogramCounts[index] ?? 0 }))
+      : histogramResult?.data && Array.isArray(histogramResult.data.bins) && Array.isArray(histogramResult.data.counts)
+        ? histogramResult.data.bins.map((bin, index) => ({ name: bin, value: histogramResult.data?.counts[index] ?? 0 }))
+        : []
+
+    const nextFeatureImportance = featureResult?.data?.features && Array.isArray(featureResult.data.features)
+      ? featureResult.data.features
+      : []
+
+    return {
+      models: nextModels ?? [],
+      predictions: safePredictions,
+      alerts: buildAlertFeed(nextAlerts ?? []),
+      history: nextHistory ?? [],
+      datasets: availableDatasets,
+      trainingStatus: nextStatus ?? DEFAULT_TRAINING_STATUS,
+      datasetInsights: datasetInsightsData,
+      datasetPredictions: datasetAnalysisResult?.predictions ?? [],
+      datasetPredictionSkippedRows: datasetAnalysisResult?.skippedRows ?? 0,
+      artifactRiskDistribution: nextRiskDistribution,
+      artifactHistogram: nextHistogram,
+      artifactFeatureImportance: nextFeatureImportance,
+      riskChartUnavailable: hasSelectedDataset ? !datasetInsightsData : (riskResult?.unavailable ?? true),
+      histogramChartUnavailable: hasSelectedDataset ? !datasetInsightsData : (histogramResult?.unavailable ?? true),
+      featureChartUnavailable: featureResult?.unavailable ?? true,
+      resolvedDatasetName,
+    }
+  }, [datasetName, loadAlertsSafely, selectedModelId])
+
+  const applyDashboardSnapshot = useCallback((snapshot: DashboardSnapshot) => {
+    if (snapshot.resolvedDatasetName !== datasetName) {
+      setDatasetName(snapshot.resolvedDatasetName)
+    }
+
+    setModels(snapshot.models)
+    setPredictions(snapshot.predictions)
+    setAlerts(snapshot.alerts)
+    setHistory(snapshot.history)
+    setDatasets(snapshot.datasets)
+    setTrainingStatus(snapshot.trainingStatus)
+    setDatasetInsights(snapshot.datasetInsights)
+    setDatasetPredictions(snapshot.datasetPredictions)
+    setDatasetPredictionSkippedRows(snapshot.datasetPredictionSkippedRows)
+    setArtifactRiskDistribution(snapshot.artifactRiskDistribution)
+    setArtifactHistogram(snapshot.artifactHistogram)
+    setArtifactFeatureImportance(snapshot.artifactFeatureImportance)
+    setRiskChartUnavailable(snapshot.riskChartUnavailable)
+    setHistogramChartUnavailable(snapshot.histogramChartUnavailable)
+    setFeatureChartUnavailable(snapshot.featureChartUnavailable)
+  }, [datasetName])
+
+  const reloadDashboardInsights = useCallback(async (options?: { clearCache?: boolean }) => {
+    try {
+      setApiError(null)
+      resetVisualizationState()
+      const snapshot = await buildDashboardSnapshot(options)
+      applyDashboardSnapshot(snapshot)
     } catch (error) {
       if (SHOULD_LOG_DASHBOARD_WARNINGS) {
         console.error('[Dashboard] Error refreshing insights:', error)
@@ -590,127 +678,25 @@ export default function AdminMlModule() {
         msg = `Connection Error: ${error.message}`
       }
       setApiError(msg)
+      setRiskChartUnavailable(true)
+      setHistogramChartUnavailable(true)
+      setFeatureChartUnavailable(true)
     } finally {
       setLoading(false)
     }
-  }, [datasetName, loadAlertsSafely, selectedModelId])
+  }, [applyDashboardSnapshot, buildDashboardSnapshot, resetVisualizationState])
 
   useEffect(() => {
     let active = true
 
     ;(async () => {
       try {
-        setApiError(null)
-        setDatasetInsights(null)
-        setArtifactRiskDistribution([])
-        setArtifactHistogram([])
-        setArtifactFeatureImportance([])
         setLoading(true)
-        // Fetch models first, then use them to build chart URLs with correct model_name
-        const [initialModels, initialDatasets] = await Promise.all([getMlModels(), listDatasets()])
-        const initialSelectedModel = (selectedModelId !== null
-          ? initialModels.find((model) => model.id === selectedModelId)
-          : undefined) ?? initialModels.find((model) => model.isBestModel || model.status === 'Active') ?? initialModels[0]
-        const selectedModelNameLocal = initialSelectedModel?.name ?? ''
-        const resolvedDatasetNameLocal = resolveSelectedDatasetName(datasetName, initialDatasets)
-        const selectedDatasetLabel = resolvedDatasetNameLocal || 'No dataset selected'
-        const datasetChartQueryLocal = buildChartQuery(resolvedDatasetNameLocal, selectedModelNameLocal)
-        const hasSelectedDatasetLocal = Boolean(resolvedDatasetNameLocal)
-
-        if (active) {
-          setModels(initialModels)
-          setDatasets(initialDatasets)
-          if (resolvedDatasetNameLocal !== datasetName) {
-            setDatasetName(resolvedDatasetNameLocal)
-          }
-        }
-
-        // Fetch predictions and history (models already fetched)
-        const [nextPredictions, nextAlerts, nextHistory] = await Promise.all([getMlPredictions(), loadAlertsSafely(), getTrainingHistory()])
-
-        let fallbackHighRiskCount = 0
-
+        setApiError(null)
+        resetVisualizationState()
+        const snapshot = await buildDashboardSnapshot()
         if (!active) return
-        setPredictions(nextPredictions ?? [])
-        setHistory(nextHistory ?? [])
-
-        // Fetch charts using selected model derived from the returned models
-        try {
-          const datasetInsightsPromise = hasSelectedDatasetLocal
-            ? fetchMlChart<MlDatasetInsights>(`/ml/dataset-insights${datasetChartQueryLocal}`)
-            : Promise.resolve<MlChartResponse<MlDatasetInsights>>({ data: null, unavailable: false })
-          const riskPromise = hasSelectedDatasetLocal
-            ? Promise.resolve<MlChartResponse<{ low: number; medium: number; high: number }>>({ data: null, unavailable: false })
-            : fetchMlChart<{ low: number; medium: number; high: number }>(`/ml/chart/risk-distribution${datasetChartQueryLocal}`)
-          const histogramPromise = hasSelectedDatasetLocal
-            ? Promise.resolve<MlChartResponse<{ bins: string[]; counts: number[] }>>({ data: null, unavailable: false })
-            : fetchMlChart<{ bins: string[]; counts: number[] }>(`/ml/chart/probability-histogram${datasetChartQueryLocal}`)
-
-          const [featureResult, datasetInsightsResult, riskResult, histogramResult] = await Promise.all([
-            fetchMlChart<{ features: Array<{ name: string; importance: number }> }>('/ml/chart/feature-importance' + (selectedModelNameLocal ? `?model_name=${encodeURIComponent(selectedModelNameLocal)}` : '')),
-            datasetInsightsPromise,
-            riskPromise,
-            histogramPromise,
-          ])
-
-          const datasetInsightsData = datasetInsightsResult?.data && typeof datasetInsightsResult.data.low === 'number'
-            ? datasetInsightsResult.data
-            : null
-
-          setDatasetInsights(datasetInsightsData)
-
-          if (featureResult?.data?.features && Array.isArray(featureResult.data.features)) {
-            setArtifactFeatureImportance(featureResult.data.features)
-          }
-          setFeatureChartUnavailable(featureResult?.unavailable ?? true)
-
-          if (datasetInsightsData) {
-            fallbackHighRiskCount = datasetInsightsData.high
-            setArtifactRiskDistribution([
-              { name: 'Low', value: datasetInsightsData.low },
-              { name: 'Medium', value: datasetInsightsData.medium },
-              { name: 'High', value: datasetInsightsData.high },
-            ])
-          } else if (riskResult?.data && typeof riskResult.data.low === 'number' && typeof riskResult.data.medium === 'number' && typeof riskResult.data.high === 'number') {
-            fallbackHighRiskCount = riskResult.data.high
-            setArtifactRiskDistribution([
-              { name: 'Low', value: riskResult.data.low },
-              { name: 'Medium', value: riskResult.data.medium },
-              { name: 'High', value: riskResult.data.high },
-            ])
-          } else {
-            setArtifactRiskDistribution([])
-          }
-          setRiskChartUnavailable(hasSelectedDatasetLocal ? (datasetInsightsResult?.unavailable ?? true) : (riskResult?.unavailable ?? true))
-
-          if (datasetInsightsData && Array.isArray(datasetInsightsData.bins) && Array.isArray(datasetInsightsData.histogramCounts)) {
-            setArtifactHistogram(datasetInsightsData.bins.map((bin, index) => ({ name: bin, value: datasetInsightsData.histogramCounts[index] ?? 0 })))
-          } else if (histogramResult?.data && Array.isArray(histogramResult.data.bins) && Array.isArray(histogramResult.data.counts)) {
-            setArtifactHistogram(histogramResult.data.bins.map((bin, index) => ({ name: bin, value: histogramResult.data?.counts[index] ?? 0 })))
-          } else {
-            setArtifactHistogram([])
-          }
-          setHistogramChartUnavailable(hasSelectedDatasetLocal ? (datasetInsightsResult?.unavailable ?? true) : (histogramResult?.unavailable ?? true))
-        } catch (error) {
-          setArtifactRiskDistribution([])
-          setArtifactHistogram([])
-          setArtifactFeatureImportance([])
-          setRiskChartUnavailable(true)
-          setHistogramChartUnavailable(true)
-          setFeatureChartUnavailable(true)
-          setArtifactRiskDistribution([])
-          setArtifactHistogram([])
-          setArtifactFeatureImportance([])
-          setRiskChartUnavailable(true)
-          setHistogramChartUnavailable(true)
-          setFeatureChartUnavailable(true)
-          if (SHOULD_LOG_DASHBOARD_WARNINGS) {
-            console.warn('[Dashboard] Error loading charts:', error instanceof Error ? error.message : 'Unknown error')
-          }
-        }
-
-        if (!active) return
-        setAlerts(buildAlertFeed(nextAlerts ?? [], nextPredictions ?? [], fallbackHighRiskCount, selectedDatasetLabel, selectedModelNameLocal))
+        applyDashboardSnapshot(snapshot)
       } catch (error) {
         if (!active) return
         if (SHOULD_LOG_DASHBOARD_WARNINGS) {
@@ -725,28 +711,21 @@ export default function AdminMlModule() {
         setPredictions([])
         setAlerts([])
         setHistory([])
+        setDatasets([])
+        setTrainingStatus(DEFAULT_TRAINING_STATUS)
+        resetVisualizationState()
+        setRiskChartUnavailable(true)
+        setHistogramChartUnavailable(true)
+        setFeatureChartUnavailable(true)
       } finally {
         if (active) setLoading(false)
       }
     })()
 
-    // load uploaded datasets separately
-    listDatasets()
-      .then((items) => { if (active) setDatasets(items ?? []) })
-      .catch((error) => {
-        if (active) {
-          if (SHOULD_LOG_DASHBOARD_WARNINGS) {
-            console.warn('[Dashboard] Error loading datasets:', error instanceof Error ? error.message : 'Unknown error')
-          }
-          setDatasets([])
-        }
-      })
-
     return () => {
       active = false
     }
-  }, [datasetName, loadAlertsSafely, selectedModelId])
-
+  }, [applyDashboardSnapshot, buildDashboardSnapshot, resetVisualizationState])
 
   useEffect(() => {
     if (trainingStatus.status !== 'queued' && trainingStatus.status !== 'training') {
@@ -762,7 +741,7 @@ export default function AdminMlModule() {
       if (status.status === 'completed' && !trainingCompletionHandledRef.current) {
         trainingCompletionHandledRef.current = true
         setRetrainRequestPending(false)
-        await reloadDashboardInsights()
+        await reloadDashboardInsights({ clearCache: true })
         setTrainingStatus(status)
         pushToast('Model retraining completed successfully. Dashboard insights updated.', 'ML charts, metrics, and alerts have been refreshed.', 'emerald')
         return
@@ -798,6 +777,7 @@ export default function AdminMlModule() {
   const chartFeatureImportance = artifactFeatureImportance
   const focusedModel = selectedModel ?? activeModel
   const selectedDatasetLabel = datasetName.trim() || 'No dataset selected'
+  const selectedModelLabel = focusedModel?.name ?? 'Selected model'
   const selectedHighRiskCount = datasetInsights?.high ?? (chartRiskDistribution.find((bucket) => bucket.name === 'High')?.value ?? 0)
   const datasetMetricsAvailable = Boolean(datasetInsights?.hasGroundTruth && datasetInsights.evaluatedRows > 0)
   const displayedMetrics = datasetMetricsAvailable
@@ -819,31 +799,104 @@ export default function AdminMlModule() {
     ? `${selectedDatasetLabel} dataset evaluation`
     : 'stored evaluation metric'
   const displayedLastTrainedAt = focusedModel?.lastTrainedAt ?? trainingStatus.lastTrainedAt
+  const datasetFallbackRiskCounts = useMemo(() => {
+    const counts: Record<MlDatasetPredictionItem['riskLevel'], number> = { High: 0, Medium: 0, Low: 0 }
+
+    for (const item of datasetPredictions) {
+      counts[item.riskLevel] += 1
+    }
+
+    return counts
+  }, [datasetPredictions])
+  const datasetSummary = useMemo(() => ({
+    totalScoredRows: datasetInsights?.totalPredictions ?? datasetPredictions.length,
+    highRiskRows: datasetInsights?.high ?? datasetFallbackRiskCounts.High,
+    mediumRiskRows: datasetInsights?.medium ?? datasetFallbackRiskCounts.Medium,
+    lowRiskRows: datasetInsights?.low ?? datasetFallbackRiskCounts.Low,
+    previewRows: datasetPredictions.length,
+    evaluatedRows: datasetInsights?.evaluatedRows ?? 0,
+  }), [datasetFallbackRiskCounts, datasetInsights, datasetPredictions.length])
+  const datasetPreviewRiskCounts = useMemo(() => {
+    const counts: Record<DatasetPredictionRiskFilter, number> = {
+      All: datasetPredictions.length,
+      High: 0,
+      Medium: 0,
+      Low: 0,
+    }
+
+    for (const item of datasetPredictions) {
+      counts[item.riskLevel] += 1
+    }
+
+    return counts
+  }, [datasetPredictions])
+  const filteredDatasetPredictionRows = useMemo(() => {
+    const normalizedQuery = deferredDatasetPredictionQuery.trim().toLowerCase()
+    const rows = datasetPredictions
+      .filter((item) => datasetRiskFilter === 'All' || item.riskLevel === datasetRiskFilter)
+      .filter((item) => {
+        if (!normalizedQuery) return true
+
+        return item.propertyId.toLowerCase().includes(normalizedQuery)
+          || item.owner.toLowerCase().includes(normalizedQuery)
+          || item.prediction.toLowerCase().includes(normalizedQuery)
+          || item.modelName.toLowerCase().includes(normalizedQuery)
+      })
+
+    rows.sort((left, right) => {
+      if (datasetSortMode === 'PropertyAscending') {
+        return left.propertyId.localeCompare(right.propertyId, undefined, { numeric: true, sensitivity: 'base' })
+          || left.rowNumber - right.rowNumber
+      }
+
+      const riskDelta = getDatasetRiskWeight(right.riskLevel) - getDatasetRiskWeight(left.riskLevel)
+
+      if (datasetSortMode === 'ScoreDescending') {
+        return right.probabilityScore - left.probabilityScore
+          || riskDelta
+          || left.rowNumber - right.rowNumber
+      }
+
+      return riskDelta
+        || right.probabilityScore - left.probabilityScore
+        || left.rowNumber - right.rowNumber
+    })
+
+    return rows
+  }, [datasetPredictions, datasetRiskFilter, datasetSortMode, deferredDatasetPredictionQuery])
+  const datasetPredictionPreviewRows = filteredDatasetPredictionRows.slice(0, 12)
+  const selectedDatasetPrediction = useMemo(
+    () => filteredDatasetPredictionRows.find((item) => getDatasetPredictionKey(item) === selectedDatasetPredictionKey)
+      ?? filteredDatasetPredictionRows[0]
+      ?? null,
+    [filteredDatasetPredictionRows, selectedDatasetPredictionKey],
+  )
+  const selectedDatasetPredictionRank = useMemo(() => {
+    if (!selectedDatasetPrediction) {
+      return null
+    }
+
+    return filteredDatasetPredictionRows.findIndex((item) => getDatasetPredictionKey(item) === getDatasetPredictionKey(selectedDatasetPrediction)) + 1
+  }, [filteredDatasetPredictionRows, selectedDatasetPrediction])
+  const datasetPredictionNotice = useMemo(() => {
+    const notices: string[] = []
+
+    if (datasetPredictionSkippedRows > 0) {
+      notices.push(`${datasetPredictionSkippedRows.toLocaleString('en-PH')} dataset row(s) were skipped because the ML service rejected them.`)
+    }
+
+    if (datasetInsights && datasetPredictions.length > 0 && datasetPredictions.length < datasetInsights.totalPredictions) {
+      notices.push(`Aggregate cards and charts reflect all ${datasetInsights.totalPredictions.toLocaleString('en-PH')} scored row(s). The review queue below uses ${datasetPredictions.length.toLocaleString('en-PH')} preview row(s) returned for UI review.`)
+    }
+
+    return notices.length > 0 ? notices.join(' ') : undefined
+  }, [datasetInsights, datasetPredictionSkippedRows, datasetPredictions.length])
 
   // Training History pagination
   const itemsPerPage = 8
   const totalPages = Math.ceil(history.length / itemsPerPage)
   const validPage = Math.max(1, Math.min(trainingHistoryPage, totalPages || 1))
   const paginatedHistory = history.slice((validPage - 1) * itemsPerPage, validPage * itemsPerPage)
-
-  useEffect(() => {
-    if (!selectedPrediction) return
-
-    let active = true
-    getMlExplanation(selectedPrediction.id)
-      .then((explanation) => {
-        if (!active) return
-        setSelectedExplanation(explanation)
-      })
-      .catch(() => {
-        if (!active) return
-        setSelectedExplanation(null)
-      })
-
-    return () => {
-      active = false
-    }
-  }, [selectedPrediction])
 
   const handleExport = async () => {
     if (!user) return
@@ -910,6 +963,8 @@ export default function AdminMlModule() {
         pushToast('Dataset deleted', `${displayName} removed.`, 'emerald')
         const items = await listDatasets()
         setDatasets(items)
+        const nextSelectedDataset = storedAs === datasetName ? resolveSelectedDatasetName('', items ?? []) : datasetName
+        setDatasetName(nextSelectedDataset)
       } else {
         pushToast('Delete failed', `Unable to delete ${displayName}.`, 'red')
       }
@@ -929,7 +984,16 @@ export default function AdminMlModule() {
 
       const model = modelSelectorOptions.find((m) => m.id === resolvedSelectedModelId)
       if (!model) throw new Error('No model selected for retraining')
-      const result = await trainModel({ modelName: model.name, datasetName })
+      const retrainDatasetName = resolveSelectedDatasetName(datasetName, datasets)
+      if (!retrainDatasetName.trim()) {
+        throw new Error('Select or upload a dataset CSV before retraining.')
+      }
+
+      if (retrainDatasetName !== datasetName) {
+        setDatasetName(retrainDatasetName)
+      }
+
+      const result = await trainModel({ modelName: model.name, datasetName: retrainDatasetName })
       setHistory((current) => [result, ...current])
       setTrainingStatus({
         status: 'queued',
@@ -958,13 +1022,18 @@ export default function AdminMlModule() {
       setLoading(true)
       await promoteModel(modelId)
       setSelectedModelId(modelId)
-      await reloadDashboardInsights()
+      await reloadDashboardInsights({ clearCache: true })
       pushToast('Active model switched', 'The selected model is now active across the ML module.', 'emerald')
     } catch (error) {
       setLoading(false)
       pushToast('Model switch failed', error instanceof Error ? error.message : 'Unable to activate the selected model.', 'red')
     }
   }
+
+  const retryDashboardLoad = useCallback(() => {
+    setLoading(true)
+    void reloadDashboardInsights()
+  }, [reloadDashboardInsights])
 
   const getModelOptionLabel = (model: MlModelSummary) => model.displayLabel ?? `${model.name} · ${model.version}`
 
@@ -1047,10 +1116,7 @@ export default function AdminMlModule() {
             <h3 className="text-sm font-semibold text-red-900">Machine Learning API Connection Failure</h3>
             <p className="mt-1 text-sm text-red-700">{apiError}</p>
             <button
-              onClick={() => {
-                setLoading(true);
-                void reloadDashboardInsights();
-              }}
+              onClick={retryDashboardLoad}
               className="mt-3 inline-flex items-center gap-2 rounded-lg bg-red-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-800 transition"
             >
               <RefreshCcw className="h-3 w-3 animate-spin" />
@@ -1107,21 +1173,11 @@ export default function AdminMlModule() {
         >
           <div className="h-72 relative">
             {riskChartUnavailable && chartRiskDistribution.length === 0 ? (
-              <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-50 border border-slate-200 p-6 text-center">
-                <AlertTriangle className="h-8 w-8 text-amber-500 mb-2 animate-bounce" />
-                <p className="text-sm font-medium text-slate-800">ML Risk Chart Unavailable</p>
-                <p className="text-xs text-slate-500 mt-1 max-w-[200px]">The ML service is starting up or temporarily sleeping.</p>
-                <button
-                  onClick={() => {
-                    setLoading(true);
-                    void reloadDashboardInsights();
-                  }}
-                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 shadow-sm"
-                >
-                  <RefreshCcw className="h-3 w-3" />
-                  Retry Chart
-                </button>
-              </div>
+              <UnavailableChartState
+                title="ML Risk Chart Unavailable"
+                message="The ML service is starting up or temporarily sleeping."
+                onRetry={retryDashboardLoad}
+              />
             ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <PieChart>
@@ -1143,21 +1199,11 @@ export default function AdminMlModule() {
         >
           <div className="h-72 relative">
             {histogramChartUnavailable && chartProbabilityHistogram.length === 0 ? (
-              <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-50 border border-slate-200 p-6 text-center">
-                <AlertTriangle className="h-8 w-8 text-amber-500 mb-2 animate-bounce" />
-                <p className="text-sm font-medium text-slate-800">ML Histogram Unavailable</p>
-                <p className="text-xs text-slate-500 mt-1 max-w-[200px]">The ML service is starting up or temporarily sleeping.</p>
-                <button
-                  onClick={() => {
-                    setLoading(true);
-                    void reloadDashboardInsights();
-                  }}
-                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 shadow-sm"
-                >
-                  <RefreshCcw className="h-3 w-3" />
-                  Retry Chart
-                </button>
-              </div>
+              <UnavailableChartState
+                title="ML Histogram Unavailable"
+                message="The ML service is starting up or temporarily sleeping."
+                onRetry={retryDashboardLoad}
+              />
             ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={chartProbabilityHistogram}>
@@ -1179,21 +1225,11 @@ export default function AdminMlModule() {
         >
           <div className="h-72 relative">
             {featureChartUnavailable && chartFeatureImportance.length === 0 ? (
-              <div className="absolute inset-0 flex flex-col items-center justify-center rounded-xl bg-slate-50 border border-slate-200 p-6 text-center">
-                <AlertTriangle className="h-8 w-8 text-amber-500 mb-2 animate-bounce" />
-                <p className="text-sm font-medium text-slate-800">ML Feature Importance Unavailable</p>
-                <p className="text-xs text-slate-500 mt-1 max-w-[200px]">The ML service is starting up or temporarily sleeping.</p>
-                <button
-                  onClick={() => {
-                    setLoading(true);
-                    void reloadDashboardInsights();
-                  }}
-                  className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 shadow-sm"
-                >
-                  <RefreshCcw className="h-3 w-3" />
-                  Retry Chart
-                </button>
-              </div>
+              <UnavailableChartState
+                title="ML Feature Importance Unavailable"
+                message="The ML service is starting up or temporarily sleeping."
+                onRetry={retryDashboardLoad}
+              />
             ) : (
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={chartFeatureImportance} layout="vertical">
@@ -1413,6 +1449,270 @@ export default function AdminMlModule() {
 
       </div>
 
+      <SectionCard
+        title="Prediction Review Console"
+        subtitle={`Predictions generated from ${selectedDatasetLabel} using ${selectedModelLabel}`}
+        notice={datasetPredictionNotice}
+      >
+        {!datasetName.trim() ? (
+          <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5 text-sm text-slate-500">
+            Select or upload a dataset CSV to generate model-based predictions.
+          </div>
+        ) : datasetPredictions.length === 0 ? (
+          <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-5 text-sm text-slate-500">
+            No dataset predictions are available yet for the selected model and CSV.
+          </div>
+        ) : (
+          <div className="space-y-5">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <PredictionSummaryCard
+                label="Scored Rows"
+                value={datasetSummary.totalScoredRows.toLocaleString('en-PH')}
+                subtitle={`${selectedDatasetLabel} scored by ${selectedModelLabel}`}
+                tone="blue"
+              />
+              <PredictionSummaryCard
+                label="High-Risk Rows"
+                value={datasetSummary.highRiskRows.toLocaleString('en-PH')}
+                subtitle={datasetSummary.totalScoredRows > 0
+                  ? `${((datasetSummary.highRiskRows / datasetSummary.totalScoredRows) * 100).toFixed(1)}% of the full dataset analysis`
+                  : 'No scored rows yet'}
+                tone="red"
+              />
+              <PredictionSummaryCard
+                label="Preview Queue"
+                value={datasetSummary.previewRows.toLocaleString('en-PH')}
+                subtitle="Rows returned by the dataset-analysis preview for manual review"
+                tone="amber"
+              />
+              <PredictionSummaryCard
+                label="Evaluated Rows"
+                value={datasetSummary.evaluatedRows.toLocaleString('en-PH')}
+                subtitle={datasetMetricsAvailable ? 'Rows with ground-truth labels backing the evaluation metrics' : 'No ground-truth labels were detected in the selected CSV'}
+                tone="emerald"
+              />
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+              <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Bound To Current Selection</p>
+                  <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-600">
+                    <span className="rounded-full border border-slate-200 bg-white px-3 py-1.5">Dataset: {selectedDatasetLabel}</span>
+                    <span className="rounded-full border border-slate-200 bg-white px-3 py-1.5">Model: {selectedModelLabel}</span>
+                    <span className="rounded-full border border-slate-200 bg-white px-3 py-1.5">Preview rows loaded: {datasetSummary.previewRows.toLocaleString('en-PH')}</span>
+                    <span className="rounded-full border border-slate-200 bg-white px-3 py-1.5">Metrics: {datasetMetricsAvailable ? 'CSV labels detected' : 'Model-only scoring'}</span>
+                  </div>
+                </div>
+
+                <label className="block w-full xl:max-w-sm">
+                  <span className="mb-2 block text-xs font-semibold uppercase tracking-wider text-slate-500">Search preview rows</span>
+                  <input
+                    value={datasetPredictionQuery}
+                    onChange={(event) => setDatasetPredictionQuery(event.target.value)}
+                    placeholder="Property ID, owner, prediction, or model"
+                    className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-800 outline-none focus:border-blue-300"
+                  />
+                </label>
+              </div>
+
+              <div className="mt-4 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                <div className="flex flex-wrap gap-2">
+                  {DATASET_RISK_FILTER_OPTIONS.map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => setDatasetRiskFilter(option.value)}
+                      className={`rounded-full px-3 py-2 text-xs font-semibold transition ${datasetRiskFilter === option.value
+                        ? 'bg-slate-900 text-white shadow-sm'
+                        : 'border border-slate-200 bg-white text-slate-600 hover:bg-slate-100'}`}
+                    >
+                      {option.label} · {datasetPreviewRiskCounts[option.value].toLocaleString('en-PH')}
+                    </button>
+                  ))}
+                </div>
+
+                <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-slate-500">
+                  <span>Sort queue</span>
+                  <select
+                    value={datasetSortMode}
+                    onChange={(event) => setDatasetSortMode(event.target.value as DatasetPredictionSortMode)}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-medium normal-case tracking-normal text-slate-700 outline-none focus:border-blue-300"
+                  >
+                    {DATASET_SORT_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+
+              <p className="mt-3 text-xs text-slate-500">
+                Showing top {datasetPredictionPreviewRows.length.toLocaleString('en-PH')} row(s) from {filteredDatasetPredictionRows.length.toLocaleString('en-PH')} matching preview record(s). Aggregate counters and charts remain tied to the full scored dataset.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(320px,0.95fr)]">
+              <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+                {filteredDatasetPredictionRows.length === 0 ? (
+                  <div className="flex min-h-[320px] items-center justify-center p-6 text-center">
+                    <div>
+                      <p className="text-sm font-medium text-slate-800">No preview rows match the current filters.</p>
+                      <p className="mt-2 text-xs text-slate-500">Try a different risk filter, clear the search, or switch back to the full preview queue.</p>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="border-b border-slate-200 px-4 py-3">
+                      <p className="text-sm font-semibold text-slate-900">Review queue</p>
+                      <p className="text-xs text-slate-500">Highest-risk preview rows are surfaced first unless you change the sort.</p>
+                    </div>
+
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full divide-y divide-slate-200 text-left text-sm">
+                        <thead className="bg-slate-50 text-xs uppercase tracking-wider text-slate-500">
+                          <tr>
+                            <th className="px-4 py-3">Row</th>
+                            <th className="px-4 py-3">Property</th>
+                            <th className="px-4 py-3">Owner</th>
+                            <th className="px-4 py-3">Prediction</th>
+                            <th className="px-4 py-3">Risk</th>
+                            <th className="px-4 py-3">Score</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200 bg-white">
+                          {datasetPredictionPreviewRows.map((item) => {
+                            const isSelected = selectedDatasetPrediction ? getDatasetPredictionKey(item) === getDatasetPredictionKey(selectedDatasetPrediction) : false
+
+                            return (
+                              <tr
+                                key={getDatasetPredictionKey(item)}
+                                onClick={() => setSelectedDatasetPredictionKey(getDatasetPredictionKey(item))}
+                                className={`cursor-pointer align-top transition-colors hover:bg-slate-50 ${isSelected ? 'bg-blue-50/70' : ''}`}
+                              >
+                                <td className="px-4 py-3 text-slate-500">{item.rowNumber}</td>
+                                <td className="px-4 py-3 font-medium text-blue-700">{item.propertyId}</td>
+                                <td className="px-4 py-3 text-slate-700">{item.owner}</td>
+                                <td className="px-4 py-3 text-slate-700">{item.prediction}</td>
+                                <td className="px-4 py-3">
+                                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${getDatasetRiskBadgeClass(item.riskLevel)}`}>
+                                    {item.riskLevel}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-3">
+                                  <div className="min-w-[140px] space-y-2">
+                                    <div className="flex items-center justify-between gap-3">
+                                      <span className="font-medium text-slate-900">{item.probabilityScore}%</span>
+                                      <span className="text-[11px] uppercase tracking-wider text-slate-400">score</span>
+                                    </div>
+                                    <div className="h-2 overflow-hidden rounded-full bg-slate-100">
+                                      <div
+                                        className={`h-full rounded-full ${getDatasetRiskMeterClass(item.riskLevel)}`}
+                                        style={{ width: `${Math.max(0, Math.min(100, item.probabilityScore))}%` }}
+                                      />
+                                    </div>
+                                  </div>
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div className="space-y-4">
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Selected preview row</p>
+                      <h3 className="mt-2 text-lg font-semibold text-slate-900">{selectedDatasetPrediction?.propertyId ?? 'No matching row'}</h3>
+                      <p className="mt-1 text-sm text-slate-600">{selectedDatasetPrediction?.owner ?? 'Adjust the filters or search to surface a matching row.'}</p>
+                    </div>
+                    {selectedDatasetPrediction ? (
+                      <span className={`rounded-full px-3 py-1 text-xs font-semibold ${getDatasetRiskBadgeClass(selectedDatasetPrediction.riskLevel)}`}>
+                        {selectedDatasetPrediction.riskLevel}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {selectedDatasetPrediction ? (
+                    <div className="mt-4 space-y-4">
+                      <div>
+                        <div className="flex items-center justify-between text-sm">
+                          <span className="text-slate-500">Risk score</span>
+                          <span className="font-semibold text-slate-900">{selectedDatasetPrediction.probabilityScore}%</span>
+                        </div>
+                        <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200">
+                          <div
+                            className={`h-full rounded-full ${getDatasetRiskMeterClass(selectedDatasetPrediction.riskLevel)}`}
+                            style={{ width: `${Math.max(0, Math.min(100, selectedDatasetPrediction.probabilityScore))}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3 text-sm">
+                        <div className="rounded-xl border border-slate-200 bg-white p-3">
+                          <p className="text-xs uppercase tracking-wider text-slate-500">Prediction</p>
+                          <p className="mt-1 font-semibold text-slate-900">{selectedDatasetPrediction.prediction}</p>
+                        </div>
+                        <div className="rounded-xl border border-slate-200 bg-white p-3">
+                          <p className="text-xs uppercase tracking-wider text-slate-500">CSV row</p>
+                          <p className="mt-1 font-semibold text-slate-900">{selectedDatasetPrediction.rowNumber}</p>
+                        </div>
+                        <div className="rounded-xl border border-slate-200 bg-white p-3">
+                          <p className="text-xs uppercase tracking-wider text-slate-500">Queue rank</p>
+                          <p className="mt-1 font-semibold text-slate-900">{selectedDatasetPredictionRank ?? '—'}</p>
+                        </div>
+                        <div className="rounded-xl border border-slate-200 bg-white p-3">
+                          <p className="text-xs uppercase tracking-wider text-slate-500">Model</p>
+                          <p className="mt-1 font-semibold text-slate-900">{selectedDatasetPrediction.modelName}</p>
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-slate-200 bg-white p-3 text-sm text-slate-600">
+                        <p className="text-xs font-semibold uppercase tracking-wider text-slate-500">Binding</p>
+                        <p className="mt-2">This review card is sourced from <span className="font-medium text-slate-900">{selectedDatasetLabel}</span> and scored by <span className="font-medium text-slate-900">{selectedModelLabel}</span>.</p>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-4 text-sm text-slate-500">Select a preview row from the table to inspect its current dataset-scoped prediction details.</p>
+                  )}
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <p className="text-sm font-semibold text-slate-900">Full dataset risk mix</p>
+                  <p className="mt-1 text-xs text-slate-500">These counts come from the selected CSV and model, not only the preview queue.</p>
+
+                  <div className="mt-4 space-y-3">
+                    {[
+                      { label: 'High risk', value: datasetSummary.highRiskRows, bar: 'bg-red-500', track: 'bg-red-100' },
+                      { label: 'Medium risk', value: datasetSummary.mediumRiskRows, bar: 'bg-amber-500', track: 'bg-amber-100' },
+                      { label: 'Low risk', value: datasetSummary.lowRiskRows, bar: 'bg-emerald-500', track: 'bg-emerald-100' },
+                    ].map((item) => {
+                      const share = datasetSummary.totalScoredRows > 0 ? (item.value / datasetSummary.totalScoredRows) * 100 : 0
+
+                      return (
+                        <div key={item.label}>
+                          <div className="flex items-center justify-between gap-3 text-sm">
+                            <span className="font-medium text-slate-700">{item.label}</span>
+                            <span className="text-slate-500">{item.value.toLocaleString('en-PH')} · {share.toFixed(1)}%</span>
+                          </div>
+                          <div className={`mt-2 h-2 overflow-hidden rounded-full ${item.track}`}>
+                            <div className={`h-full rounded-full ${item.bar}`} style={{ width: `${Math.max(0, Math.min(100, share))}%` }} />
+                          </div>
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </SectionCard>
+
       <SectionCard title="Training History" subtitle="Recent retraining jobs and logs">
         <div className="space-y-4">
           <div className="overflow-hidden rounded-xl border border-slate-200">
@@ -1508,80 +1808,6 @@ export default function AdminMlModule() {
           )}
         </div>
       </SectionCard>
-
-      {showPredictionModal && selectedPrediction && (
-        <Modal title={`Prediction details · ${selectedPrediction.propertyId}`} onClose={() => setShowPredictionModal(false)}>
-          <div className="space-y-4">
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs uppercase tracking-wider text-slate-500">Owner</p><p className="mt-1 font-medium text-slate-900">{selectedPrediction.owner}</p></div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs uppercase tracking-wider text-slate-500">Model</p><p className="mt-1 font-medium text-slate-900">{selectedPrediction.modelName}</p></div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs uppercase tracking-wider text-slate-500">Risk Level</p><p className="mt-1 font-medium text-slate-900">{selectedPrediction.riskLevel}</p></div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4"><p className="text-xs uppercase tracking-wider text-slate-500">Probability</p><p className="mt-1 font-medium text-slate-900">{selectedPrediction.probabilityScore}%</p></div>
-            </div>
-            <div className="rounded-xl border border-slate-200 p-4">
-              <p className="text-xs uppercase tracking-wider text-slate-500">Last Payment Date</p>
-              <p className="mt-1 text-sm text-slate-700">{formatDate(selectedPrediction.lastPaymentDate)}</p>
-            </div>
-            <div className="flex justify-end gap-2">
-              <button onClick={() => setShowPredictionModal(false)} className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">Close</button>
-            </div>
-          </div>
-        </Modal>
-      )}
-
-      {showExplanationModal && selectedPrediction && selectedExplanation && (
-        <Modal title={`Explainability · ${selectedPrediction.propertyId}`} onClose={() => setShowExplanationModal(false)}>
-          <div className="space-y-5">
-            <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
-              <p className="text-xs uppercase tracking-wider text-blue-700">Why flagged as high risk?</p>
-              <p className="mt-2 text-sm text-slate-800">{selectedExplanation ? selectedExplanation.summary : 'No explanation is available for this prediction yet.'}</p>
-            </div>
-
-            <div>
-              <p className="mb-3 text-sm font-semibold text-slate-900">Top contributing factors</p>
-              {selectedExplanation && selectedExplanation.factors.length > 0 ? (
-                <div className="space-y-2">
-                  {selectedExplanation.factors.slice(0, 3).map((factor) => (
-                    <div key={factor.name} className="rounded-xl border border-slate-200 p-3">
-                      <div className="flex items-center justify-between text-sm">
-                        <span className="font-medium text-slate-800">{factor.name}</span>
-                        <span className="text-slate-500">{factor.impact}%</span>
-                      </div>
-                      <div className="mt-2 h-2 rounded-full bg-slate-100">
-                        <div className="h-2 rounded-full bg-blue-700" style={{ width: `${factor.impact}%` }} />
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-500">No contributing factor data is available yet.</div>
-              )}
-            </div>
-
-            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                <p className="text-xs uppercase tracking-wider text-slate-500">Confidence score</p>
-                <p className="mt-1 text-2xl font-semibold text-slate-900">{selectedExplanation ? percent(selectedExplanation.confidenceScore) : '—'}</p>
-              </div>
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                <p className="text-xs uppercase tracking-wider text-slate-500">Prediction</p>
-                <p className="mt-1 text-sm text-slate-700">{selectedPrediction.prediction} · {selectedPrediction.riskLevel}</p>
-              </div>
-            </div>
-
-            <div>
-              <button onClick={() => setRawJsonVisible((current) => !current)} className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
-                {rawJsonVisible ? 'Hide raw JSON' : 'Show raw JSON'}
-              </button>
-              {rawJsonVisible && selectedExplanation && (
-                <pre className="mt-3 overflow-auto rounded-xl border border-slate-200 bg-slate-950 p-4 text-xs text-slate-100">
-                  {JSON.stringify(selectedExplanation.rawJson, null, 2)}
-                </pre>
-              )}
-            </div>
-          </div>
-        </Modal>
-      )}
 
       {showRetrainModal && (
         <Modal title="Confirm retraining" onClose={() => setShowRetrainModal(false)}>

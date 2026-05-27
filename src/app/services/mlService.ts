@@ -44,6 +44,38 @@ export type MlPredictionItem = {
   modelName: string
 }
 
+export type MlDatasetPredictionItem = {
+  rowNumber: number
+  propertyId: string
+  owner: string
+  prediction: 'Late' | 'On-time'
+  riskLevel: 'Low' | 'Medium' | 'High'
+  probabilityScore: number
+  modelName: string
+}
+
+export type MlDatasetInsights = {
+  low: number
+  medium: number
+  high: number
+  totalPredictions: number
+  hasGroundTruth: boolean
+  evaluatedRows: number
+  accuracy: number
+  precision: number
+  recall: number
+  f1Score: number
+  rocAuc: number
+  bins: string[]
+  histogramCounts: number[]
+}
+
+export type MlDatasetAnalysis = {
+  summary: MlDatasetInsights | null
+  predictions: MlDatasetPredictionItem[]
+  skippedRows: number
+}
+
 export type MlExplanation = {
   id: number
   predictionId: number
@@ -109,6 +141,7 @@ const emptyOverview: DashboardOverview = {
 
 const emptyModels: MlModelSummary[] = []
 const emptyPredictions: MlPredictionItem[] = []
+const emptyDatasetAnalysis: MlDatasetAnalysis = { summary: null, predictions: [], skippedRows: 0 }
 const emptyAlerts: MlAlert[] = []
 const emptyHistory: TrainingHistoryItem[] = []
 
@@ -142,6 +175,21 @@ export async function getMlModels(): Promise<MlModelSummary[]> {
 
 export async function getMlPredictions(): Promise<MlPredictionItem[]> {
   return safeGet('/ml/predictions', emptyPredictions)
+}
+
+export async function getMlDatasetAnalysis(datasetName: string, modelName?: string): Promise<MlDatasetAnalysis> {
+  const params = new URLSearchParams()
+
+  if (datasetName) {
+    params.set('dataset', datasetName)
+  }
+
+  if (modelName) {
+    params.set('model_name', modelName)
+  }
+
+  const query = params.toString()
+  return safeGet(`/ml/dataset-analysis${query ? `?${query}` : ''}`, emptyDatasetAnalysis)
 }
 
 export async function getMlAlerts(): Promise<MlAlert[]> {
@@ -211,7 +259,16 @@ export async function uploadDataset(file: File): Promise<DatasetUploadResult> {
 }
 
 export async function listDatasets(): Promise<Array<{ fileName: string; storedAs: string; size: number; createdAt: string }>> {
-  return safeGet('/ml/datasets', [])
+  try {
+    const response = await api.get('/ml/datasets')
+    return (response.data?.data ?? response.data ?? []) as Array<{ fileName: string; storedAs: string; size: number; createdAt: string }>
+  } catch (error) {
+    if (axios.isAxiosError(error) && (error.response?.status === 401 || error.response?.status === 403 || error.response?.status === 404)) {
+      return []
+    }
+
+    throw error
+  }
 }
 
 export async function deleteDataset(storedAs: string): Promise<boolean> {

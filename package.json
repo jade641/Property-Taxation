@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -n API,WEB -c cyan,magenta \"npm run dev:api\" \"npm run dev:web:wait\"",
-    "dev:api": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Get-Process PropertyTax.API -ErrorAction SilentlyContinue | Stop-Process -Force; dotnet run --project '../backend/PropertyTax.API/PropertyTax.API/PropertyTax.API.csproj'\"",
+    "dev:api": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$port = 5079; $listeners = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; foreach ($processId in $listeners) { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue }; Get-Process PropertyTax.API -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; dotnet run --project '../backend/PropertyTax.API/PropertyTax.API/PropertyTax.API.csproj'\"",
     "dev:web": "vite",
     "dev:web:wait": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$port = 5173; $listener = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1; if ($listener) { Stop-Process -Id $listener.OwningProcess -Force -ErrorAction SilentlyContinue }; wait-on tcp:5079; vite --port 5173 --strictPort\"",
     "build": "vite build",
