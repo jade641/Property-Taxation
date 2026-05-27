@@ -27,6 +27,7 @@ import {
 } from 'recharts'
 
 import api from '../services/api'
+import Pagination from '../components/Pagination'
 import { useAuth } from '../context/AuthContext'
 import { exportCsv } from '../services/exportService'
 import {
@@ -57,6 +58,7 @@ import {
 } from '../services/mlService'
 
 const CHART_COLORS = ['#1e3a8a', '#3b82f6', '#60a5fa', '#93c5fd', '#f59e0b', '#ef4444']
+const ALERTS_PAGE_SIZE = 3
 
 function percent(value: number) {
   return `${value.toFixed(2)}%`
@@ -499,12 +501,28 @@ export default function AdminMlModule() {
   const [trainingStatus, setTrainingStatus] = useState<MlTrainingStatus>({ status: 'idle', progress: 0, currentModel: 'N/A' })
   const [retrainRequestPending, setRetrainRequestPending] = useState(false)
   const [deletingTrainingHistoryId, setDeletingTrainingHistoryId] = useState<number | null>(null)
+  const [alertPage, setAlertPage] = useState(1)
   const [trainingHistoryPage, setTrainingHistoryPage] = useState(1)
   const [toasts, setToasts] = useState<Toast[]>([])
   const fileInputRef = useRef<HTMLInputElement>(null)
   const toastIdRef = useRef(0)
   const trainingCompletionHandledRef = useRef(false)
   const deferredDatasetPredictionQuery = useDeferredValue(datasetPredictionQuery)
+
+  const alertPageCount = useMemo(
+    () => Math.max(1, Math.ceil(alerts.length / ALERTS_PAGE_SIZE)),
+    [alerts.length],
+  )
+
+  const currentAlertPage = useMemo(
+    () => Math.min(alertPage, alertPageCount),
+    [alertPage, alertPageCount],
+  )
+
+  const visibleAlerts = useMemo(() => {
+    const start = (currentAlertPage - 1) * ALERTS_PAGE_SIZE
+    return alerts.slice(start, start + ALERTS_PAGE_SIZE)
+  }, [alerts, currentAlertPage])
 
   const pushToast = (title: string, message: string, tone: Toast['tone'] = 'blue') => {
     toastIdRef.current += 1
@@ -649,6 +667,7 @@ export default function AdminMlModule() {
     setModels(snapshot.models)
     setPredictions(snapshot.predictions)
     setAlerts(snapshot.alerts)
+    setAlertPage(1)
     setHistory(snapshot.history)
     setDatasets(snapshot.datasets)
     setTrainingStatus(snapshot.trainingStatus)
@@ -1318,31 +1337,46 @@ export default function AdminMlModule() {
                     <p className="mt-1 text-xs text-slate-500">High-risk predictions and audit flags will appear here once the ML module detects records that need review.</p>
                   </div>
                 </div>
-              ) : alerts.map((alert) => (
-                <div key={`${alert.source ?? 'alert'}-${alert.id}`} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
-                  <div className="flex items-start gap-3">
-                    <div className={`mt-1 h-2.5 w-2.5 rounded-full ${alert.severity === 'High' ? 'bg-red-500' : alert.severity === 'Medium' ? 'bg-amber-500' : 'bg-blue-500'}`} />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="font-medium text-slate-900">{alert.title}</p>
-                        <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${AlertStatusClass(alert.status)}`}>{alert.status}</span>
-                      </div>
-                      <p className="mt-1 text-xs text-slate-500">{alert.description}</p>
-                      <p className="mt-2 text-[11px] uppercase tracking-wider text-slate-400">{alert.category} · {formatDateTime(alert.createdAt)}</p>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {isAdmin ? (
-                          <button onClick={() => void handleResolveAlert(alert.id)} className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100">
-                            Resolve
-                          </button>
-                        ) : null}
-                        <button onClick={() => void handleDismissAlert(alert.id)} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-white">
-                          Dismiss
-                        </button>
+              ) : (
+                <>
+                  {visibleAlerts.map((alert) => (
+                    <div key={`${alert.source ?? 'alert'}-${alert.id}`} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <div className="flex items-start gap-3">
+                        <div className={`mt-1 h-2.5 w-2.5 rounded-full ${alert.severity === 'High' ? 'bg-red-500' : alert.severity === 'Medium' ? 'bg-amber-500' : 'bg-blue-500'}`} />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-3">
+                            <p className="font-medium text-slate-900">{alert.title}</p>
+                            <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold ${AlertStatusClass(alert.status)}`}>{alert.status}</span>
+                          </div>
+                          <p className="mt-1 text-xs text-slate-500">{alert.description}</p>
+                          <p className="mt-2 text-[11px] uppercase tracking-wider text-slate-400">{alert.category} · {formatDateTime(alert.createdAt)}</p>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {isAdmin ? (
+                              <button onClick={() => void handleResolveAlert(alert.id)} className="rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100">
+                                Resolve
+                              </button>
+                            ) : null}
+                            <button onClick={() => void handleDismissAlert(alert.id)} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-white">
+                              Dismiss
+                            </button>
+                          </div>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                </div>
-              ))}
+                  ))}
+
+                  {alerts.length > ALERTS_PAGE_SIZE ? (
+                    <div className="mt-auto flex justify-end pt-2">
+                      <Pagination
+                        currentPage={currentAlertPage}
+                        totalPages={alertPageCount}
+                        onPageChange={setAlertPage}
+                        variant="minimal"
+                      />
+                    </div>
+                  ) : null}
+                </>
+              )}
             </div>
           </SectionCard>
         </div>
